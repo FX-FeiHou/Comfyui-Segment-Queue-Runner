@@ -1,6 +1,6 @@
 # ComfyUI Segment Queue Runner
 
-[中文说明 / 简体中文](sslocal://flow/file_open?url=README_CN.md&flow_extra=eyJsaW5rX3R5cGUiOiJjb2RlX2ludGVycHJldGVyIn0=)
+[中文说明 / 简体中文](sslocal://flow/file_open?url=https%3A%2F%2Fgithub.com%2FFX-FeiHou%2FComfyui-Segment-Queue-Runner%2Fblob%2Fmain%2FREADME_CN.md&flow_extra=eyJsaW5rX3R5cGUiOiJjb2RlX2ludGVycHJldGVyIn0=)
 
 An automated long-video generation node for ComfyUI Wan Animate / KJ Context, supporting segmented generation, seamless transitions, auto scene switching, breakpoint resuming, auto merging, and audio sync.
 
