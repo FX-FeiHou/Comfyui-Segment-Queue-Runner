@@ -15,6 +15,7 @@
 
 ## 📦 安装方法
 cd ComfyUI/custom_nodes
+
 git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
 ## 🚀 快速开始
