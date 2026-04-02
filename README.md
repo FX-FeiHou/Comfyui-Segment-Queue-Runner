@@ -1,103 +1,73 @@
-🎬 ComfyUI Segment Queue Runner
+Gemini 说
+🎬 Segment Queue Runner
 
-Developed by: FX-FeiHou FeiHou & XueZi 
+The Segment Queue Runner (SQR) is a specialized automation node designed for the ComfyUI Wan Animate workflow. It enables the generation of long videos by splitting tasks into manageable segments, ensuring seamless transitions while preventing system memory or VRAM exhaustion.
+🚀 Key Features
 
-The Segment Queue Runner is a powerful automation node designed for the ComfyUI Wan Animate workflow. It solves the problem of "VRAM/RAM out of memory" during long video generation by automatically splitting videos into segments, processing them with seamless transitions, and merging them into a final masterpiece.
-🌟 Key Features
+    🔧 Segmented Generation: Automatically divides long videos into multiple parts to avoid system crashes due to high memory or VRAM usage.
 
-    🚀 Turbo Segmentation: Automatically splits long videos into multiple segments to prevent memory crashes.
+    🔗 Seamless Connections: Each segment automatically utilizes the end frames of the previous segment as a transition to maintain motion continuity.
 
-    🔗 Seamless Transitions: Each segment reads the end of the previous one to maintain motion continuity.
+    ⏩ Automatic Transitions: Supports multiple reference images to achieve automatic costume changes or scene transitions across different segments.
 
-    🎭 Dynamic Turnaround: Supports multiple reference images for automatic character or scene transitions.
+    💾 Breakpoint Resume: Features an automatic progress tracking system that allows users to resume generation from the last completed segment if interrupted.
 
-    ⚡ Breakpoint Recovery: Automatically records progress, allowing you to resume from where you left off.
+    🎬 Automated Merging: Uses FFmpeg to automatically concatenate all segments into a final video output.
 
-    🎞️ One-Click Merge: Uses ffmpeg to automatically concatenate segments and sync audio.
+    🎵 Audio Alignment: Automatically extracts and aligns audio from the reference video by calculating frame offsets based on the frame rate.
 
-    🎵 Smart Audio Sync: Automatically extracts and offsets audio from the reference video.
+🛠 Installation
+1. Clone the Repository
 
-📥 Installation 
-Option 1: ComfyUI-Manager (Recommended)
-
-    Open ComfyUI-Manager.
-
-    Click "Install Custom Nodes".
-
-    Search for Segment Queue Runner.
-
-    Click Install and restart ComfyUI.
-
-Option 2: Manual Installation (Git)
+Navigate to your ComfyUI/custom_nodes directory and run the following command:
 Bash
 
-cd ComfyUI/custom_nodes/
-git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
-cd Comfyui-Segment-Queue-Runner
-pip install -r requirements.txt
+git clone https://github.com/FX-FeiHou/comfyui_segment_queue_runner.git
 
-Note: Ensure FFmpeg is installed and added to your system's PATH for the merging feature to work.
+2. Requirements
 
-⚙️ Parameters
-Parameter	Icon	Description
-Total Frames	🔢	
+    FFmpeg: This node requires FFmpeg to be installed on your system and added to your PATH environment variable, or the ffmpeg.exe file must be placed in the ComfyUI root directory.
 
-Input from Load Video frame_count.
-Frame Rate	⏱️	
+    Workflow Compatibility: Specifically designed for the Wan Animate KJ Context workflow.
 
-Input from Load Video fps for audio alignment.
-Segments	✂️	
+⚙️ Core Parameters
+Mandatory Inputs
 
-Number of parts (2–20) based on your VRAM limits.
-Start From	🚩	
+    Total Frames: Must be connected to the frame_count output of the Load Video node.
 
-1 for new projects; specific ID for resuming.
-Execute	🔘	
+    Frame Rate: Must be connected to the fps output of the Load Video node to ensure proper audio synchronization.
 
-OFF for Preview (Check logs); ON for production.
-Enable Resume	⏯️	
+Segment Settings
 
-Uses a selected video clip as the starting transition.
+    Segment Count: Defines how many parts the video will be split into (Range: 2–20).
 
-📖 Usage Guide
-Step 1: Setup & Binding 🔗
+    Start From Segment: Sets the starting segment index, typically set to 1 for new projects.
 
-    Connect frame_count and fps from your Load Video node.
+    Execution: A toggle to switch between Preview Mode (False) and Generation Mode (True).
 
-    Click "Set Node ID" (设置节点ID) buttons on the UI to bind the Load Video, Video Combine, and WanAnimateEmbeds nodes by clicking them in your workspace.
+    Enable Resume: Used in conjunction with Resume Video Selection to continue from a specific interrupted segment.
 
-Step 2: Preview Mode 🔍
+📐 Technical Logic
+Cropping Rules ✂️
 
-    Set Execute to OFF.
+To ensure invisible transitions at the stitching points, the node automatically crops the segments as follows:
 
-    Adjust Segments so each part fits your VRAM (e.g., 150-200 frames).
+    First Segment: Does not crop the beginning; crops the final 16 frames.
 
-    Run the prompt to view the segmentation plan in the logs or ShowText node.
+    Middle Segments: Crops both the first 16 frames and the last 16 frames.
 
-Step 3: Customization & Execution 🚀
+    Last Segment: Crops the first 16 frames; does not crop the end.
 
-    (Optional) Click "Select Segment Images" (选择分段参考图) to assign unique styles per segment.
+📖 Usage Modes
 
-    Switch Execute to ON and run.
+    Preview Mode (Execution = False) 📋: Displays the segmentation plan, including frame ranges and estimated duration, via a text display node.
 
-    The node will sequentially process segments and merge the final video into your output folder.
+    New Generation (Execution = True) 🚀: Generates all segments from the first index and merges them automatically upon completion.
 
-🛠️ Breakpoint Recovery ⏩
+    Resume Mode (Enable Resume = True) ⏩: Allows continuation after a failure by selecting the last successful segment and setting the starting index to the next segment.
 
-If generation is interrupted:
+⚖️ Copyright & Credits
 
-    Identify the last completed segment from the console.
+Segment Queue Runner Developed by: FeiHou & XueZi.
 
-    Set "Start From Segment" to the next segment ID.
-
-    Click "Resume Video Selection" and pick the last successful video.
-
-    Set "Enable Resume" to ON and Execute to ON, then run.
-
-⚖️ License & Credits
-
-    Developed by: FX-FeiHou FX-FeiHou FeiHou & XueZi 
-
-    Special Thanks: wuwukaka (for transition_video logic) and Kijai (for base wrapper maintenance).
-
-    License: This project is licensed under the MIT License. Free for personal and commercial use; please provide attribution to the original authors.
+All rights reserved. Material retention is supported for further utilization.
