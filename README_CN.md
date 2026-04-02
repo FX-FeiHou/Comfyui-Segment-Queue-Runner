@@ -1,6 +1,6 @@
 # ComfyUI 分段队列运行器
 
-[English](sslocal://flow/file_open?url=README.md&flow_extra=eyJsaW5rX3R5cGUiOiJjb2RlX2ludGVycHJldGVyIn0=)
+# [English](README.md) 
 
 一个适用于 ComfyUI Wan Animate / KJ Context 的自动化长视频生成节点，支持分段生成、无缝过渡、自动场景切换、断点续跑、自动合并和音频同步。
 
