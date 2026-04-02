@@ -15,6 +15,7 @@ An automated long-video generation node for ComfyUI Wan Animate / KJ Context, su
 
 ## 📦 Installation
 cd ComfyUI/custom_nodes
+
 git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
 ## 🚀 Quick Start
