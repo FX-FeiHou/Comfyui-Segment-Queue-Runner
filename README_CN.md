@@ -18,6 +18,14 @@ cd ComfyUI/custom_nodes
 
 git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
+## 📢 更新日志
+
+### [v2.0] - 2026-04-03
+**新增功能：多任务队列支持**
+- **多任务并行提交**：支持同时提交多个生成任务。
+- **随机交叉分段采样**：系统将自动对不同任务进行分段，并采用随机交叉的方式执行采样逻辑。
+- **动态优先合并**：采用“先完工先合并”策略，执行效率更高的任务将优先完成最终合并，极大提升了创作流转速度。
+
 ## 🚀 快速开始
 1. 将 Load Video 的 frame_count 和 fps 连接到本节点
 2. 设置分段数量，关闭 Run 先预览计划

@@ -2,6 +2,12 @@ import { app } from "../../scripts/app.js";
 
 const THUMB_URL = "/sqr/image_thumb?file=";
 
+function sqrThumbUrl(path) {
+    const sep = THUMB_URL.includes("?") ? "&" : "?";
+    return THUMB_URL + encodeURIComponent(path) + sep + "_ts=" + Date.now() + "_r=" + Math.random().toString(36).slice(2, 8);
+}
+
+
 // ── SQR 上游节点收集（用于精简 prompt 提交，确保 SDPose 等无关节点不被执行）──
 function _sqrCollectUpstream(nodeId, promptOutput, visited) {
     if (visited.has(nodeId)) return;
@@ -89,7 +95,7 @@ async function showImageSelector(currentValue, onConfirm) {
             const badge = mkDiv(String(idx+1),
                 "position:absolute;top:1px;left:1px;background:#4a6;color:#fff;border-radius:3px;padding:0 3px;font-size:10px;font-weight:bold;line-height:15px;");
             const img = new Image();
-            img.src = "/sqr/image_thumb?file=" + encodeURIComponent(fullpath);
+            img.src = sqrThumbUrl(fullpath);
             Object.assign(img.style, {width:"66px",height:"66px",objectFit:"cover",borderRadius:"3px",display:"block",pointerEvents:"none"});
             const lbl = mkDiv(fname.length>10?fname.slice(0,9)+"…":fname,"font-size:9px;margin-top:2px;word-break:break-all;");
             lbl.title = fullpath;
@@ -225,7 +231,7 @@ async function showImageSelector(currentValue, onConfirm) {
                             cell.appendChild(badge);
                         }
                         const img = new Image();
-                        img.src = "/sqr/image_thumb?file=" + encodeURIComponent(fullp);
+                        img.src = sqrThumbUrl(fullp);
                         img.title = f;
                         Object.assign(img.style, {width:"74px",height:"74px",objectFit:"cover",borderRadius:"4px",display:"block"});
                         const lbl = mkDiv(f.length>10?f.slice(0,9)+"…":f,"font-size:9px;margin-top:2px;word-break:break-all;");
@@ -1365,7 +1371,8 @@ app.registerExtension({
                     dispName = dispName.slice(0, -1);
                 }
                 if (dispName !== fname) dispName = dispName.slice(0, -1) + "…";
-                const m = fname.match(/segment_transition_seg(\d+)\.mp4$/i);
+                // 支持新命名 sqr_trans_{run_id}_seg{N}.mp4 及旧命名 segment_transition_seg{N}.mp4
+                const m = fname.match(/sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$/i) || fname.match(/segment_transition_seg(\d+)\.mp4$/i);
                 if (m) {
                     const seg = parseInt(m[1]) + 1;
                     const fromW = getW("从第几段开始");
@@ -1517,7 +1524,7 @@ app.registerExtension({
                         const badge = mkDiv(String(idx+1),
                             "position:absolute;top:2px;left:2px;background:#3a9;color:#fff;border-radius:3px;padding:0 4px;font-size:10px;font-weight:bold;line-height:16px;z-index:1;");
                         const img = new Image();
-                        img.src = "/sqr/image_thumb?file=" + encodeURIComponent(p);
+                        img.src = sqrThumbUrl(p);
                         Object.assign(img.style, {width:"92px",height:"92px",objectFit:"contain",display:"block",borderRadius:"4px",pointerEvents:"none"});
                         const lbl = mkDiv(fname.length>14?fname.slice(0,13)+"…":fname,
                             "font-size:9px;margin-top:3px;word-break:break-all;opacity:.7;");
@@ -1601,14 +1608,14 @@ app.registerExtension({
                 _paths: [], _loaded: {}, _dragSrc: -1, _dragOver: -1,
                 syncPaths() {
                     this._paths = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean);
+                    const nextLoaded = {};
                     this._paths.forEach(p => {
-                        if (!this._loaded[p]) {
-                            const img = new Image();
-                            img.src = "/sqr/image_thumb?file=" + encodeURIComponent(p);
-                            img.onload = () => node.setDirtyCanvas?.(true, true);
-                            this._loaded[p] = img;
-                        }
+                        const img = new Image();
+                        img.src = sqrThumbUrl(p);
+                        img.onload = () => node.setDirtyCanvas?.(true, true);
+                        nextLoaded[p] = img;
                     });
+                    this._loaded = nextLoaded;
                 },
                 computeSize(width) {
                     if (!this._paths.length) return [width, 0];

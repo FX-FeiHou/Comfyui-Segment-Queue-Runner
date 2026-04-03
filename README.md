@@ -18,6 +18,14 @@ cd ComfyUI/custom_nodes
 
 git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
+## 📢 Changelog
+
+### [v2.0] - 2026-04-03
+**New Feature: Multi-Task Queue Support**
+- **Simultaneous Submission**: Support for submitting multiple generation tasks at once.
+- **Random Interleaved Segmented Sampling**: Tasks are automatically segmented and executed using a random interleaved sampling strategy.
+- **Dynamic Priority Merging**: Implementation of a "first-finished, first-merged" policy, ensuring that tasks completed earlier are merged first to optimize workflow efficiency.
+
 ## 🚀 Quick Start
 1. Connect frame_count and fps from Load Video to this node
 2. Set segment count, turn off Run to preview the plan first

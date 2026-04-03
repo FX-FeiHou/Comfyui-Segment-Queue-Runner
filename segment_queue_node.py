@@ -2,7 +2,7 @@
 ComfyUI 分段自动队列节点 - 最终版
 """
 
-import math, copy, json, time, os, threading, urllib.request
+import math, copy, json, time, os, threading, urllib.request, hashlib, uuid
 import server, folder_paths
 from aiohttp import web
 
@@ -11,29 +11,17 @@ _sqr_log_buf: dict = {}
 
 def _sqr_log(uid, msg):
     text = "" if msg is None else str(msg)
-
-    # 控制台仍然按原样输出，方便调试
     print(text)
-
     if not uid:
         return
-
     k = str(uid)
     buf = _sqr_log_buf.setdefault(k, [])
-
-    # 按行写入缓冲，避免整段多行日志在前端变成一条
     lines = text.splitlines()
-
-    # splitlines() 对空字符串会返回 []，这里补成一条空行
     if not lines:
         lines = [""]
-
     buf.extend(lines)
-
-    # 如果原文本以换行结尾，补一个空行，保留视觉间隔
     if text.endswith("\n"):
         buf.append("")
-
     if len(buf) > 3000:
         _sqr_log_buf[k] = buf[-3000:]
 
@@ -98,6 +86,22 @@ def clear_checkpoint(unique_id):
         pass
 
 
+def _build_safe_input_copy_name(src_path: str, unique_id=None, prefix: str = "sqr_ref") -> str:
+    """为复制到 input/ 的文件生成带来源签名的唯一文件名，避免同名覆盖。"""
+    try:
+        real = os.path.realpath(src_path)
+        st = os.stat(real)
+        sig_src = f"{real}|{st.st_mtime_ns}|{st.st_size}"
+    except Exception:
+        real = os.path.realpath(src_path)
+        sig_src = real
+    sig = hashlib.sha1(sig_src.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    base = os.path.basename(src_path)
+    if unique_id:
+        return f"{prefix}_{unique_id}_{sig}_{base}"
+    return f"{prefix}_{sig}_{base}"
+
+
 def save_speed_record(total_secs, total_frames_run):
     if total_frames_run <= 0 or total_secs <= 0:
         return
@@ -128,7 +132,6 @@ def build_plan_text(total_frames, segments, start_from_segment, node_id, frame_r
         lines.append(f"  第{i+1}段 skip={skip} limit={limit} 音频={audio_s:.2f}s  {status}")
     lines.append(SEP)
     lines.append("")
-    # 预计时长
     speed = load_speed_record()
     frames_to_run = sum(lmt for ii, (_, lmt) in enumerate(seg_list) if ii >= start_idx)
     segs_to_run_n = len(seg_list) - start_idx
@@ -142,11 +145,9 @@ def build_plan_text(total_frames, segments, start_from_segment, node_id, frame_r
 
 
 def find_video_combine_node(prompt: dict, combine_node_id: str) -> str | None:
-    """找主输出 VHS_VideoCombine 节点"""
     nid = combine_node_id.strip()
     if nid and nid in prompt:
         return nid
-    # 自动找 save_output=True 的 VHS_VideoCombine
     for nid, node in prompt.items():
         if node.get("class_type") == "VHS_VideoCombine":
             inputs = node.get("inputs", {})
@@ -156,10 +157,8 @@ def find_video_combine_node(prompt: dict, combine_node_id: str) -> str | None:
 
 
 def find_audio_filename(prompt: dict, node_id: str) -> str | None:
-    """从 target LoadVideo 节点取视频文件名，用于创建临时音频节点"""
     node = prompt.get(node_id, {})
     inputs = node.get("inputs", {})
-    # widgets_values 里的 video 字段
     video = inputs.get("video", "")
     if video and isinstance(video, str):
         return video
@@ -233,11 +232,7 @@ def interrupt_current(host="127.0.0.1:8188"):
 TRANSITION_FRAMES = 32
 
 
-
 def merge_videos(video_paths: list, output_path: str, target_fps: float = None) -> bool:
-    """用 ffmpeg concat demuxer 拼接多个视频。
-    target_fps: 指定时对所有视频重新编码为统一帧率（续跑时前段帧率可能不同）。
-    """
     import subprocess, tempfile
     if not video_paths:
         return False
@@ -248,7 +243,6 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None) 
                 f.write("file " + repr(p) + "\n")
             list_path = f.name
         if target_fps and target_fps > 0:
-            # 先把每个视频转换为目标帧率的临时文件，再 concat
             import tempfile as _tf
             converted = []
             fps_str = f"{target_fps:.6f}".rstrip("0").rstrip(".")
@@ -263,9 +257,7 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None) 
                 if r2.returncode == 0:
                     converted.append(tmp)
                 else:
-                    # 转换失败，用原文件
                     converted.append(vp)
-            # 重写 list_path 用转换后的文件
             with open(list_path, "w", encoding="utf-8") as lf:
                 for p in converted:
                     lf.write("file " + repr(p) + "\n")
@@ -277,7 +269,6 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None) 
                    "-i", list_path, "-c", "copy", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         os.unlink(list_path)
-        # 清理临时转换文件
         for _tmp in (converted if "converted" in dir() else []):
             try:
                 if _tmp not in video_paths and os.path.exists(_tmp):
@@ -305,18 +296,12 @@ class SegmentQueueRunner:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # 永远不缓存：每次点运行按钮都强制重新执行节点
         return float("nan")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # 顺序：节点ID按钮占位、总帧数、帧率、分段数、从第几段、参考图按钮占位、执行、续跑按钮占位、启用续跑
-                # 节点 ID 字段（由 JS 按钮填入，用户不直接编辑）
-
-
-                # 主要参数
                 "帧率": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 120.0, "forceInput": True,
                     "tooltip": "视频帧率，必须连接 Load Video 的帧率输出。\nFrame rate: must connect to Load Video fps output."}),
                 "总帧数": ("INT", {"default": 0, "min": 0, "max": 99999, "forceInput": True,
@@ -325,11 +310,8 @@ class SegmentQueueRunner:
                     "tooltip": "分几段处理。\nNumber of segments."}),
                 "从第几段开始": ("INT", {"default": 1, "min": 1, "max": 20,
                     "tooltip": "从第几段开始生成，续跑时填写实际起始段。\nStart from which segment. Set accordingly when resuming."}),
-
-                # 执行
                 "执行": ("BOOLEAN", {"default": False,
                     "tooltip": "关闭=预览分段规划；开启=正式执行。\nOff=preview plan only; On=start execution."}),
-
                 "启用续跑": ("BOOLEAN", {"default": False,
                     "tooltip": "开启后使用上方选择的视频作为首段过渡起点。\nEnable resume: use selected video as transition source for first segment."}),
                 "参考视频节点ID": ("STRING", {"default": ""}),
@@ -338,9 +320,9 @@ class SegmentQueueRunner:
                 "参考图节点ID":   ("STRING", {"default": ""}),
                 "分段参考图":     ("STRING", {"default": ""}),
                 "续跑视频路径":   ("STRING", {"default": ""}),
-                "sqr_save_png":      ("STRING", {"default": "true"}),  # 由 JS 设置控制
-                "sqr_frame_offset":  ("INT",    {"default": -1}),       # 情形B续跑帧偏移
-                "sqr_pre_segments":  ("STRING", {"default": ""}),       # 续跑前段素材路径，逗号分隔
+                "sqr_save_png":      ("STRING", {"default": "true"}),
+                "sqr_frame_offset":  ("INT",    {"default": -1}),
+                "sqr_pre_segments":  ("STRING", {"default": ""}),
             },
             "hidden": {
                 "过渡跳过帧数": ("INT", {"default": -1}),
@@ -359,7 +341,6 @@ class SegmentQueueRunner:
             过渡跳过帧数=-1,
             prompt=None, extra_pnginfo=None, unique_id=None):
 
-        # 兼容别名
         total_frames       = 总帧数
         segments           = 分段数
         start_from_segment = max(1, min(从第几段开始, segments))
@@ -368,14 +349,11 @@ class SegmentQueueRunner:
         combine_nid        = 输出节点ID.strip()
         ae_node_id         = 动作嵌入节点ID.strip()
         resume_video_path  = 续跑视频路径.strip()
-        resume_enabled     = bool(resume_video_path)  # 有路径即为续跑模式
+        resume_enabled     = bool(resume_video_path)
         skip_frames_manual = 过渡跳过帧数
         ri_node_id         = 参考图节点ID.strip()
         ref_imgs_str       = 分段参考图.strip()
 
-
-        # ── 提前计算帧偏移（重新设计续跑模式需要用它修正 plan_text）──
-        # 双重读取：优先从参数注入，备用从 prompt 里直接读（防止序列化跳过）
         _frame_offset_param = sqr_frame_offset if sqr_frame_offset >= 0 else -1
         if _frame_offset_param < 0 and prompt and unique_id:
             _self_inputs = (prompt or {}).get(str(unique_id), {}).get("inputs", {})
@@ -383,13 +361,11 @@ class SegmentQueueRunner:
             _frame_offset_param = int(_fo_val) if _fo_val is not None and int(_fo_val) >= 0 else -1
         _frame_offset = _frame_offset_param if _frame_offset_param >= 0 else 0
 
-        # plan_text 使用与实际执行一致的帧数（重新设计续跑时为剩余帧数）
         _plan_frames = max(1, total_frames - _frame_offset) if _frame_offset > 0 else total_frames
         plan_text = build_plan_text(
             _plan_frames, segments, start_from_segment, node_id, frame_rate)
 
         def _do_interrupt():
-            """优先用 ComfyUI 内部 API 直接设置中断标志（同步、无 HTTP 开销）。"""
             try:
                 from comfy import model_management as _mm
                 _mm.interrupt_current_processing()
@@ -398,7 +374,6 @@ class SegmentQueueRunner:
             except Exception:
                 pass
             try:
-                # 回退：HTTP interrupt
                 interrupt_current()
                 print("[SQR] ✓ 中断标志已设置（HTTP）。")
             except Exception as _e:
@@ -406,7 +381,6 @@ class SegmentQueueRunner:
 
         if not 执行:
             msg = "[预览模式]\n" + plan_text
-            # 5ms 后中断：足够 ShowText 显示计划文本（< 1ms），早于 SDPose 启动（> 100ms）
             def _pi(): time.sleep(0.005); _do_interrupt()
             threading.Thread(target=_pi, daemon=True).start()
             _sqr_log(unique_id, msg)
@@ -419,13 +393,9 @@ class SegmentQueueRunner:
             _sqr_log(unique_id, "[SQR] ✗ 参考视频节点ID 不能为空。")
             return {}
 
-        # JS 端精简提交时，完整工作流通过 extra_pnginfo.sqr_full_prompt 传入
-        # 若存在则用完整版构建分段 wf，否则回退到当前 prompt（含中断保底）
         _sqr_full_prompt = (extra_pnginfo or {}).get("sqr_full_prompt")
         _effective_prompt = _sqr_full_prompt if _sqr_full_prompt else prompt
-        # 精简提交时 SDPose 根本不在队列里，无需中断；回退时保留中断保底
         _need_interrupt = (_sqr_full_prompt is None)
-        # 前端 client_id：分段 prompt 带上它，采样预览和节点缩略图才能正确路由到浏览器
         _client_id = str((extra_pnginfo or {}).get("sqr_client_id") or "")
 
         if node_id not in (_effective_prompt or {}):
@@ -443,17 +413,40 @@ class SegmentQueueRunner:
         segs_to_run = seg_list[start_idx:]
         base_prompt = copy.deepcopy(_effective_prompt)
 
-        # 找 AnimateEmbeds
         ae_nid = ae_node_id or find_animate_embeds_node(base_prompt) or ""
-
-        # 找主输出 VHS_VideoCombine
         vc_nid = find_video_combine_node(base_prompt, combine_nid) or ""
 
-        # 解析参考图
         ref_images_list = [x.strip() for x in ref_imgs_str.split(",") if x.strip()] \
                           if ref_imgs_str else []
 
-        # 续跑视频：如果是外部路径则复制到 input/ 目录再使用（和参考图处理方式一致）
+        # ── 参考图快照 ──────────────────────────────────────────────
+        _snap_paths = []
+        if ref_images_list:
+            import shutil as _snap_shutil
+            _snap_ts   = time.strftime('%Y%m%d_%H%M%S')
+            _input_dir = folder_paths.get_input_directory()
+            _snapped   = []
+            for _orig in ref_images_list:
+                _src = _orig if os.path.isabs(_orig) \
+                       else os.path.join(_input_dir, _orig)
+                if os.path.isfile(_src):
+                    _snap_name = f"sqr_refsnap_{unique_id}_{_snap_ts}_{os.path.basename(_orig)}"
+                    _snap_dst  = os.path.join(_input_dir, _snap_name)
+                    if os.path.realpath(_src) != os.path.realpath(_snap_dst):
+                        try:
+                            _snap_shutil.copy2(_src, _snap_dst)
+                            _snapped.append(_snap_dst)
+                            _snap_paths.append(_snap_dst)
+                        except Exception as _se:
+                            print(f"[SQR] ⚠ 参考图快照失败({os.path.basename(_orig)}): {_se}")
+                            _snapped.append(_orig)
+                    else:
+                        _snapped.append(_orig)
+                else:
+                    _snapped.append(_orig)
+            ref_images_list = _snapped
+
+        # ── 续跑视频处理 ──
         manual_video_path = manual_video_frames = None
         if resume_enabled and resume_video_path:
             p = resume_video_path if os.path.isabs(resume_video_path) \
@@ -464,7 +457,6 @@ class SegmentQueueRunner:
                     input_dir = folder_paths.get_input_directory()
                     fname = os.path.basename(p)
                     dst = os.path.join(input_dir, fname)
-                    # 只有不在 input/ 目录时才复制
                     if os.path.realpath(p) != os.path.realpath(dst):
                         _shutil.copy2(p, dst)
                         print(f"[SQR] 已复制续跑视频到 input/: {fname}")
@@ -481,55 +473,56 @@ class SegmentQueueRunner:
             else:
                 print(f"[SQR] ⚠ 续跑视频不存在: {p}")
 
-        # 从 target LoadVideo 的 inputs 里取宽高来源（连线 [src_node, slot]）
-        # 供动态创建的 transition LoadVideo 使用，确保宽高与用户设置同步
         width_src = height_src = None
         target_inputs = base_prompt.get(node_id, {}).get("inputs", {})
         if "custom_width" in target_inputs and isinstance(target_inputs["custom_width"], list):
-            width_src = target_inputs["custom_width"]   # [get_node_id, slot]
+            width_src = target_inputs["custom_width"]
         if "custom_height" in target_inputs and isinstance(target_inputs["custom_height"], list):
             height_src = target_inputs["custom_height"]
 
         def log(msg: str):
             _sqr_log(unique_id, f"[SQR] {msg}")
 
-        # 从 target LoadVideo 取视频文件名（用于创建临时音频节点）
         audio_filename = find_audio_filename(base_prompt, node_id)
         if audio_filename:
             _sqr_log(unique_id, f"[SQR] 音频文件: {audio_filename}")
         else:
             _sqr_log(unique_id, f"[SQR] ⚠ 无法获取音频文件名")
 
-        # 找图像来源节点（裁切前插入 ImageFromBatch 用）
-        # VHS_VideoCombine[vc_nid].images 的上游节点即为图像来源
         image_src_node = None
         if vc_nid and vc_nid in base_prompt:
             img_input = base_prompt[vc_nid]["inputs"].get("images")
             if isinstance(img_input, list) and len(img_input) == 2:
-                image_src_node = img_input  # [node_id, slot]
+                image_src_node = img_input
                 print(f"[SQR] 图像来源: {image_src_node}")
 
-        # 解析续跑前段素材路径（需求6：续跑时把前段和本次一起合并）
         pre_segment_paths = [p.strip() for p in sqr_pre_segments.split(",")
                              if p.strip() and os.path.isfile(p.strip())] \
                             if sqr_pre_segments.strip() else []
         if pre_segment_paths:
             print(f"[SQR] 续跑前段素材: {len(pre_segment_paths)} 个文件")
 
+        # ── 每次 run() 生成唯一运行ID，隔离多任务并发的文件名 ──────────
+        # 场景1(多工作流)和场景2(同工作流多队列)都依赖此 run_id 避免文件冲突
+        run_id = uuid.uuid4().hex[:8]
+
         def submit_all():
             last_video_path   = manual_video_path
             last_video_frames = manual_video_frames
-            segment_output_paths = []  # 每段裁切后输出视频路径（按顺序，用于最终合并）
-            sqr_cut_paths = []           # 合并完成后清理的临时裁切文件
+            segment_output_paths = []
+            # sqr_cut_paths 记录 (dir, prefix) 供清理使用，避免依赖文件名正则
+            sqr_cut_cleanup = []   # list of (search_dir, prefix_str)
+            sqr_cut_paths   = []   # 仅用于合并
             _t0 = time.time()
             _total_frames_ran = sum(limit for _, limit in segs_to_run)
-            _all_done = False  # 标记是否全部段正常完成（中途中断则保留 checkpoint）
+            _all_done = False
 
+            # 日志分隔符：同一节点(uid)多次队列时区分不同任务
+            log(f"{'═'*20} 运行ID={run_id} {'═'*20}")
             log(f"AnimateEmbeds节点: [{ae_nid}]")
             log(f"输出节点: [{vc_nid}]")
             if ref_images_list:
                 log(f"参考图列表: {ref_images_list}")
-            # 运行模式标识
             if _frame_offset > 0:
                 log(f"=== 重新设计续跑模式（帧偏移={_frame_offset}，跳过前{_frame_offset}帧参考视频）===")
             elif resume_enabled:
@@ -547,34 +540,20 @@ class SegmentQueueRunner:
                 total_segs     = len(seg_list)
                 use_transition = last_video_path is not None
                 wf             = copy.deepcopy(base_prompt)
-                TRIM           = 16  # 每端裁切帧数，提前定义供音频计算使用
-                audio_skip_frames = skip  # 默认值，后面音频块会精确覆写
+                TRIM           = 16
+                audio_skip_frames = skip
 
-                # 日志：头部直接显示实际注入 Load Video 的 skip 值（Bug C 修复）
                 _actual_skip = skip + _frame_offset
                 if _frame_offset > 0:
                     log(f"--- 第{seg_num}/{total_segs}段  实际skip={_actual_skip}（段内{skip}+偏移{_frame_offset}）limit={limit} ---")
                 else:
                     log(f"--- 第{seg_num}/{total_segs}段  skip={_actual_skip}  limit={limit} ---")
 
-                # ── 参考视频分段 ──
                 wf[node_id]["inputs"]["skip_first_frames"] = _actual_skip
                 wf[node_id]["inputs"]["frame_load_cap"]    = limit
 
                 # ── 音频对齐 ──
-                # 主节点[312]接完整生成帧（含transition），帧序列：
-                #   有transition: [0..31]=transition帧 + [32..32+limit-1]=本段内容
-                #   完整帧第0帧对应时间轴第(skip - TRANSITION_FRAMES)帧
-                #   → 主节点音频起点 = (skip - TRANSITION_FRAMES) / fps
-                #
-                # cut_vc接裁切后帧，裁掉前16帧后，第0帧对应时间轴第(skip - TRIM)帧
-                #   → cut_vc音频起点 = (skip - TRIM) / fps = (skip - 16) / fps
-                #   → 即 audio_skip_frames（下面计算）
-                #
-                # 无transition（第1段）：完整帧就是本段内容，第0帧对应skip帧
-                #   → 主节点和cut_vc音频起点都是 skip / fps
                 if vc_nid and vc_nid in wf and audio_filename:
-                    # 实际音频帧 = skip（段内相对偏移）+ _frame_offset（情形B起始偏移）
                     _real_skip = skip + _frame_offset
                     if use_transition:
                         audio_skip_frames    = max(0, _real_skip - TRIM)
@@ -597,11 +576,10 @@ class SegmentQueueRunner:
                     wf[vc_nid]["inputs"]["audio"] = [audio_tmp_id, 0]
                     log(f"  ✓ 主节点音频: start={audio_start_time:.3f}s ({transition_note})")
                 elif vc_nid and vc_nid in wf:
-                    # 没有音频文件名时退回到 LoadVideo 直接输出
                     wf[vc_nid]["inputs"]["audio"] = [node_id, 2]
                     log(f"  ⚠ 音频: 无法获取文件名，直接用LoadVideo音频(skip={skip}帧)")
 
-                # ── transition_video 直接注入 AnimateEmbeds ──
+                # ── transition_video 注入 AnimateEmbeds ──
                 if ae_nid and ae_nid in wf:
                     if use_transition:
                         t_skip = skip_frames_manual if skip_frames_manual >= 0 \
@@ -617,7 +595,6 @@ class SegmentQueueRunner:
                             "select_every_nth":  1,
                             "format":            "AnimateDiff",
                         }
-                        # 注入宽高（与用户设置同步）
                         if width_src:
                             tv_inputs["custom_width"]  = width_src
                         if height_src:
@@ -633,18 +610,20 @@ class SegmentQueueRunner:
                 if ref_images_list and ri_node_id and ri_node_id in wf:
                     img_idx   = min(i, len(ref_images_list) - 1)
                     img_entry = ref_images_list[img_idx]
-                    # 支持完整路径：若是绝对路径则复制到 input/ 目录后使用文件名
                     if os.path.isabs(img_entry):
                         import shutil as _shutil
-                        img_fname = os.path.basename(img_entry)
-                        img_dst   = os.path.join(folder_paths.get_input_directory(), img_fname)
-                        # 只有源文件不在 input/ 目录时才复制，避免同文件占用报错
-                        if os.path.realpath(img_entry) != os.path.realpath(img_dst):
+                        input_dir = folder_paths.get_input_directory()
+                        src_real  = os.path.realpath(img_entry)
+                        if os.path.realpath(os.path.dirname(src_real)) == os.path.realpath(input_dir):
+                            img_name = os.path.basename(src_real)
+                        else:
+                            img_fname = _build_safe_input_copy_name(src_real, unique_id=unique_id, prefix="sqr_refrun")
+                            img_dst   = os.path.join(input_dir, img_fname)
                             try:
-                                _shutil.copy2(img_entry, img_dst)
+                                _shutil.copy2(src_real, img_dst)
                             except Exception as e:
                                 log(f"  ⚠ 参考图复制失败: {e}")
-                        img_name = img_fname
+                            img_name = img_fname
                     else:
                         img_name = img_entry
                     wf[ri_node_id]["inputs"]["image"] = img_name
@@ -652,28 +631,21 @@ class SegmentQueueRunner:
                     if wv: wv[0] = img_name
                     log(f"  ✓ 参考图[{img_idx+1}]: {img_name}")
 
-                # ── 自动裁切（固定模式，动态注入 ImageFromBatch）──
-                # 规则：
-                #   第1段（无transition）：不裁前，裁后16帧
-                #   中间段（有transition）：裁前16，裁后16
-                #   最后段（有transition）：裁前16，不裁后
-                # 实现：动态创建 1~2 个 ImageFromBatch 节点插在图像输出和 VHS_VideoCombine 之间
+                # ── 自动裁切 ──
                 TRIM = 16
                 is_last_seg = (seg_num == total_segs)
                 total_raw = limit + (TRANSITION_FRAMES if use_transition else 0)
 
-                image_src = image_src_node  # [node_id, slot] 格式
+                image_src = image_src_node
                 if not use_transition:
-                    # 第1段：不裁前，裁后16
                     trim_start = 0
-                    trim_len   = total_raw - TRIM  # 去掉尾16
+                    trim_len   = total_raw - TRIM
                     ifb_a = f"sqr_ifb_{seg_num}_a"
                     wf[ifb_a] = {"class_type": "ImageFromBatch",
                                  "inputs": {"image": image_src, "batch_index": trim_start, "length": trim_len}}
                     final_image_node = ifb_a
                     log(f"  裁切：不裁前，裁后{TRIM}帧→输出{trim_len}帧")
                 elif is_last_seg:
-                    # 最后段：裁前16，不裁后
                     trim_start = TRIM
                     trim_len   = total_raw - TRIM
                     ifb_a = f"sqr_ifb_{seg_num}_a"
@@ -682,10 +654,9 @@ class SegmentQueueRunner:
                     final_image_node = ifb_a
                     log(f"  裁切：裁前{TRIM}帧，不裁后→输出{trim_len}帧")
                 else:
-                    # 中间段：裁前16，裁后16（用2个节点）
                     trim_start  = TRIM
-                    after_front = total_raw - TRIM       # 裁前16后剩余
-                    trim_len    = after_front - TRIM     # 再裁后16
+                    after_front = total_raw - TRIM
+                    trim_len    = after_front - TRIM
                     ifb_a = f"sqr_ifb_{seg_num}_a"
                     ifb_b = f"sqr_ifb_{seg_num}_b"
                     wf[ifb_a] = {"class_type": "ImageFromBatch",
@@ -696,26 +667,21 @@ class SegmentQueueRunner:
                     log(f"  裁切：裁前{TRIM}裁后{TRIM}→输出{trim_len}帧")
 
                 # ── VHS_VideoCombine 双路输出 ──
-                # [312] 保留完整未裁视频（存入 history，用于 transition 和合并）
-                # sqr_cut_vc_{seg_num} 输出裁切后视频（用户最终看到的版本）
                 if vc_nid and vc_nid in wf:
-                    # 主节点 [312] 接完整图像，保持原有音频行为不干涉
                     wf[vc_nid]["inputs"]["images"] = image_src
 
-                    # 裁切输出节点（复制 312 的配置，接裁切后图像）
                     cut_vc_id = f"sqr_cut_vc_{seg_num}"
                     cut_inputs = copy.deepcopy(wf[vc_nid]["inputs"])
                     cut_inputs["images"]          = [final_image_node, 0]
                     cut_inputs["save_output"]     = True
-                    cut_inputs["save_metadata"]   = False  # 不产生 png 元数据图（sqr_cut系列不需要）
-                    # 提取主节点的子文件夹前缀（如 "dancing video/"），sqr_cut 输出到同一位置
+                    cut_inputs["save_metadata"]   = False
                     _main_prefix = wf[vc_nid]["inputs"].get("filename_prefix", "")
                     _slash = max(_main_prefix.rfind("/"), _main_prefix.rfind("\\"))
                     _subfolder_prefix = _main_prefix[:_slash+1] if _slash >= 0 else ""
-                    cut_inputs["filename_prefix"] = f"{_subfolder_prefix}sqr_cut_{seg_num}_"
+                    # ── 使用 run_id 隔离：不同任务的裁切文件不会同名覆盖 ──
+                    _cut_file_prefix = f"sqr_cut_{run_id[:6]}_{seg_num}_"
+                    cut_inputs["filename_prefix"] = f"{_subfolder_prefix}{_cut_file_prefix}"
 
-                    # cut_vc 接裁切后帧，第0帧 = 时间轴第(skip-16)帧
-                    # audio_skip_frames = skip-16（有transition）或 skip（无transition）
                     if audio_filename:
                         cut_audio_id = f"sqr_cut_audio_{seg_num}"
                         wf[cut_audio_id] = {
@@ -730,8 +696,12 @@ class SegmentQueueRunner:
                         log(f"  ✓ cut_vc音频: start={audio_skip_frames/frame_rate:.3f}s (={audio_skip_frames}帧)")
 
                     wf[cut_vc_id] = {"class_type": "VHS_VideoCombine", "inputs": cut_inputs}
+                    # 记录清理信息（目录+前缀），不依赖后续文件名解析
+                    _cut_search_dir = os.path.join(folder_paths.get_output_directory(),
+                                                   _subfolder_prefix.rstrip("/\\")) \
+                                      if _subfolder_prefix else folder_paths.get_output_directory()
+                    sqr_cut_cleanup.append((_cut_search_dir, _cut_file_prefix))
 
-                # ── 移除本节点避免递归 ──
                 if unique_id and unique_id in wf:
                     del wf[unique_id]
 
@@ -742,12 +712,9 @@ class SegmentQueueRunner:
                     ok  = wait_for_prompt(pid)
                     if ok:
                         log(f"✓ 第{seg_num}段完成")
-                        # 全部段完成则标记
                         if is_last_seg:
                             _all_done = True
-                        # 写断点 checkpoint
                         if unique_id:
-                            # 记录 load video 完整参数，作为条件6检测依据
                             _lv_inputs = base_prompt.get(node_id, {}).get("inputs", {})
                             _ref_video_params = {
                                 "video":             _lv_inputs.get("video", ""),
@@ -756,19 +723,20 @@ class SegmentQueueRunner:
                                 "skip_first_frames": _lv_inputs.get("skip_first_frames", 0),
                                 "select_every_nth":  _lv_inputs.get("select_every_nth", 1),
                             }
-                            # base_frame_offset = 本次运行的基础帧偏移（供自动续跑使用）
-                            # frame_offset_for_resume = 累计偏移（供重新设计续跑使用，从断点位置另起分段）
                             _next_seg_idx = seg_num
                             if _next_seg_idx < len(seg_list):
                                 _frame_offset_for_resume = _frame_offset + seg_list[_next_seg_idx][0]
                             else:
                                 _frame_offset_for_resume = _frame_offset + (skip + limit)
+                            # ── transition_video 用 run_id 命名，续跑检测时能找到正确文件 ──
+                            _trans_fname = f"sqr_trans_{run_id}_seg{seg_num}.mp4"
                             write_checkpoint(unique_id, {
                                 "unique_id":              unique_id,
+                                "run_id":                 run_id,
                                 "completed_seg":          seg_num,
                                 "total_segs":             total_segs,
                                 "next_seg":               seg_num + 1,
-                                "transition_video":       f"segment_transition_seg{seg_num}.mp4",
+                                "transition_video":       _trans_fname,
                                 "ref_images":             ref_images_list,
                                 "segments":               segments,
                                 "ref_video":              _ref_video_params.get("video", ""),
@@ -777,12 +745,10 @@ class SegmentQueueRunner:
                                 "base_frame_offset":      _frame_offset,
                                 "frame_offset_for_resume": _frame_offset_for_resume,
                             })
-                        # 每段完成后更新速度记录（跑任意一段都有数据）
                         _elapsed = time.time() - _t0
                         _frames_done = sum(lmt for _, lmt in segs_to_run[:i+1])
                         save_speed_record(_elapsed, _frames_done)
 
-                        # 取裁切后视频路径（用于最终合并，从 sqr_cut_vc 取）
                         cut_vc_id_done = f"sqr_cut_vc_{seg_num}"
                         if vc_nid:
                             cut_vpath, _ = get_output_video_info(pid, cut_vc_id_done)
@@ -790,19 +756,20 @@ class SegmentQueueRunner:
                                 cut_vpath, _ = get_output_video_info(pid, vc_nid)
                             if cut_vpath:
                                 segment_output_paths.append(cut_vpath)
-                                sqr_cut_paths.append(cut_vpath)   # 合并后清理
+                                sqr_cut_paths.append(cut_vpath)
                                 log(f"  ✓ 裁切输出: {os.path.basename(cut_vpath)}")
                             else:
                                 log(f"  ⚠ 未找到裁切输出视频")
 
-                        # 取完整视频（从主节点 vc_nid 取，接的是 image_src 完整帧）
+                        # 取完整视频复制为过渡素材，文件名含 run_id，多任务不冲突
                         vpath, vframes = get_output_video_info(pid, vc_nid) if vc_nid else (None, None)
                         if not vpath:
                             log(f"  ⚠ 完整视频获取失败，下段过渡将跳过")
                         if vpath:
                             import shutil
                             input_dir   = folder_paths.get_input_directory()
-                            input_fname = f"segment_transition_seg{seg_num}.mp4"
+                            # ── 关键修复：用 run_id 隔离过渡文件，多任务不会互相覆盖 ──
+                            input_fname = f"sqr_trans_{run_id}_seg{seg_num}.mp4"
                             input_path  = os.path.join(input_dir, input_fname)
                             try:
                                 shutil.copy2(vpath, input_path)
@@ -823,7 +790,6 @@ class SegmentQueueRunner:
                     break
 
             # ── 合并所有段输出视频 ──
-            # 续跑时：将前段素材拼到本次产出前面，一起合并成完整成品
             if pre_segment_paths:
                 log(f"续跑合并：前段 {len(pre_segment_paths)} 个 + 本次 {len(segment_output_paths)} 个")
                 segment_output_paths = pre_segment_paths + segment_output_paths
@@ -831,7 +797,6 @@ class SegmentQueueRunner:
             if len(segment_output_paths) >= 2:
                 log(f"开始合并 {len(segment_output_paths)} 段视频...")
                 output_dir   = folder_paths.get_output_directory()
-                # 合并文件也放到与主节点相同的子文件夹
                 if vc_nid and base_prompt and vc_nid in base_prompt:
                     _mp = base_prompt[vc_nid]["inputs"].get("filename_prefix", "")
                     _sl = max(_mp.rfind("/"), _mp.rfind("\\"))
@@ -840,7 +805,8 @@ class SegmentQueueRunner:
                         os.makedirs(os.path.join(output_dir, _sub.rstrip("/\\")), exist_ok=True)
                 else:
                     _sub = ""
-                merged_fname = f"sqr_merged_{seg_num:04d}_.mp4"
+                # 合并文件名含 run_id，多任务并发时不冲突
+                merged_fname = f"sqr_merged_{run_id}_{time.strftime('%Y%m%d_%H%M%S')}_.mp4"
                 merged_path  = os.path.join(output_dir, _sub + merged_fname)
                 if merge_videos(segment_output_paths, merged_path,
                                target_fps=frame_rate if pre_segment_paths else None):
@@ -850,31 +816,18 @@ class SegmentQueueRunner:
             elif len(segment_output_paths) == 1:
                 log(f"只有1段，无需合并")
 
-            # 清理临时裁切文件：
-            # - 删除不带音频的 sqr_cut_*.mp4（无用）和 sqr_cut_*.png（VHS元数据图）
-            # - 保留带 -audio 的 sqr_cut_*-audio.mp4（有声音，供用户手动剪辑）
-            import re as _re
-            _cleaned_prefixes = set()
-            for _p in sqr_cut_paths:
+            # ── 清理临时裁切文件（使用记录的 dir+prefix，无需正则解析文件名）──
+            for (_clean_dir, _clean_prefix) in sqr_cut_cleanup:
                 try:
-                    _dir  = os.path.dirname(_p)
-                    _base = os.path.basename(_p)
-                    # 提取 sqr_cut_N_ 前缀（支持子文件夹）
-                    _m = _re.match(r".*(sqr_cut_\d+_)", _base)
-                    if not _m:
+                    if not os.path.isdir(_clean_dir):
                         continue
-                    _prefix = _m.group(1)
-                    if _prefix in _cleaned_prefixes:
-                        continue
-                    _cleaned_prefixes.add(_prefix)
-                    for _f in os.listdir(_dir):
-                        if not _f.startswith(_prefix):
+                    for _f in os.listdir(_clean_dir):
+                        if not _f.startswith(_clean_prefix):
                             continue
-                        _fpath = os.path.join(_dir, _f)
+                        _fpath = os.path.join(_clean_dir, _f)
                         # 保留带 -audio 的 mp4
                         if _f.endswith(".mp4") and "-audio" in _f:
                             continue
-                        # 删除不带 -audio 的 mp4 和所有 png
                         if _f.endswith(".mp4") or _f.endswith(".png"):
                             try:
                                 os.remove(_fpath)
@@ -884,9 +837,8 @@ class SegmentQueueRunner:
                 except Exception:
                     pass
 
-            # 清理主节点 [312] 因重执行产生的 png
-            # 是否清理由 SQR 节点设置的 save_png 参数决定（从 extra_pnginfo 传入）
-            _sqr_save_png = (str(sqr_save_png).lower() != "false")  # "false"=清理, 其它=保留
+            # 清理主节点 png
+            _sqr_save_png = (str(sqr_save_png).lower() != "false")
             _should_clean_main_png = not _sqr_save_png
             print(f"[SQR] Save png 设置: {sqr_save_png} → {'保留' if _sqr_save_png else '清理'}主节点 png")
 
@@ -915,13 +867,21 @@ class SegmentQueueRunner:
                     print("[SQR] checkpoint 已清除（全部完成）")
                 else:
                     print("[SQR] 任务中断，checkpoint 保留供续跑检测")
+
+            for _sp in _snap_paths:
+                try:
+                    if os.path.exists(_sp):
+                        os.remove(_sp)
+                        print(f"[SQR] 已清理参考图快照: {os.path.basename(_sp)}")
+                except Exception:
+                    pass
+
             log("═══ 全部完成 ═══")
 
-        # 清除旧 checkpoint（本次重新开始，旧断点失效）
+        # 清除旧 checkpoint（本次重新开始）
         if unique_id:
             clear_checkpoint(unique_id)
 
-        # 运行模式标识（与控制台日志格式一致，ShowText 同步显示）
         if _frame_offset > 0:
             _mode_header = f"=== 重新设计续跑模式（帧偏移={_frame_offset}，跳过前{_frame_offset}帧）==="
         elif resume_enabled:
@@ -932,7 +892,6 @@ class SegmentQueueRunner:
 
         t = threading.Thread(target=submit_all, daemon=True)
         t.start()
-        # 精简提交时 SDPose 不在队列，无需中断；回退到完整 prompt 时保留 5ms 中断保底
         if _need_interrupt:
             def _ei(): time.sleep(0.005); _do_interrupt()
             threading.Thread(target=_ei, daemon=True).start()
@@ -957,12 +916,10 @@ async def sqr_clear_logs(request):
 
 @server.PromptServer.instance.routes.get("/sqr/checkpoint")
 async def sqr_get_checkpoint(request):
-    """返回指定节点的 checkpoint 信息"""
     uid = request.rel_url.query.get("uid", "")
     if not uid:
         return web.json_response({"checkpoint": None})
     ckpt = read_checkpoint(uid)
-    # 验证 transition 视频是否真实存在且是本次任务产生的
     if ckpt:
         input_dir = folder_paths.get_input_directory()
         tv = ckpt.get("transition_video", "")
@@ -971,15 +928,11 @@ async def sqr_get_checkpoint(request):
         if ckpt["transition_exists"] and tv_path:
             tv_mtime   = os.path.getmtime(tv_path)
             ckpt_mtime = os.path.getmtime(get_checkpoint_path(uid))
-            # 视频应在 checkpoint 写入之前（或几乎同时）产生
-            # 若视频比 checkpoint 新超过 60 秒，说明是后来别的任务覆盖的旧文件
             if tv_mtime > ckpt_mtime + 60:
                 ckpt["transition_exists"] = False
-        # 条件6：load video 完整参数是否一致（前端传入 JSON，后端比对）
         import urllib.parse as _up
         cur_params_str = request.rel_url.query.get("ref_params", "")
         ckpt_params    = ckpt.get("ref_video_params", {})
-        # 兼容旧 checkpoint（只有 ref_video 字段的）
         if not ckpt_params and ckpt.get("ref_video"):
             ckpt_params = {"video": ckpt.get("ref_video")}
         if cur_params_str and ckpt_params:
@@ -990,7 +943,6 @@ async def sqr_get_checkpoint(request):
                 for key in ("video", "force_rate", "frame_load_cap", "skip_first_frames", "select_every_nth"):
                     cv = cur_params.get(key, None)
                     kv = ckpt_params.get(key, None)
-                    # 数字类型用数值比较，字符串用字符串比较
                     if key == "video":
                         if str(cv or "") != str(kv or ""):
                             mismatches.append(key)
@@ -1013,7 +965,6 @@ async def sqr_get_checkpoint(request):
 
 @server.PromptServer.instance.routes.get("/sqr/pick_images")
 async def sqr_pick_images(request):
-    """用 tkinter 弹出原生文件选择窗口，支持多选图片"""
     import threading
     result = {"paths": [], "error": ""}
     done = threading.Event()
@@ -1042,7 +993,6 @@ async def sqr_pick_images(request):
 
 @server.PromptServer.instance.routes.get("/sqr/pick_video")
 async def sqr_pick_video(request):
-    """用 tkinter 弹出原生文件选择窗口，单选视频"""
     import threading
     result = {"path": "", "error": ""}
     done = threading.Event()
@@ -1071,7 +1021,6 @@ async def sqr_pick_video(request):
 
 @server.PromptServer.instance.routes.get("/sqr/list_images")
 async def sqr_list_images(request):
-    # 保留兼容旧接口（列 input/ 目录）
     import re
     img_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     def nat_key(s):
@@ -1086,7 +1035,6 @@ async def sqr_list_images(request):
 
 @server.PromptServer.instance.routes.get("/sqr/browse")
 async def sqr_browse(request):
-    """浏览任意目录，返回子文件夹列表和图片文件列表"""
     import re
     img_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
@@ -1097,7 +1045,6 @@ async def sqr_browse(request):
 
     import platform, string as _str
 
-    # 「此电脑」虚拟入口：展开为所有盘符
     if req_path == "__drives__":
         drives = []
         if platform.system() == "Windows":
@@ -1109,7 +1056,6 @@ async def sqr_browse(request):
             drives.append({"label": "/", "path": "/", "is_drive": True})
         return web.json_response({"type": "roots", "roots": drives})
 
-    # 没有指定路径时返回常用起始目录
     if not req_path:
         starts = []
         for label, p in [("ComfyUI input", folder_paths.get_input_directory()),
@@ -1124,7 +1070,6 @@ async def sqr_browse(request):
                 starts.append({"label": sub, "path": p})
         return web.json_response({"type": "roots", "roots": starts})
 
-    # 安全检查：必须是绝对路径且真实存在
     req_path = os.path.realpath(req_path)
     if not os.path.isdir(req_path):
         return web.json_response({"error": "路径不存在"}, status=400)
@@ -1153,10 +1098,14 @@ async def sqr_browse(request):
 
 @server.PromptServer.instance.routes.get("/sqr/list_videos")
 async def sqr_list_videos(request):
-    # 保留兼容旧接口，列 input/ 目录视频（自然排序，segment_transition_seg 系列排最前）
     import re
     vid_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     def sort_key(fname):
+        # 新命名格式 sqr_trans_{run_id}_seg{N}.mp4 排最前，按段号排序
+        m = re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
+        if m:
+            return (0, int(m.group(1)), fname)
+        # 兼容旧命名格式 segment_transition_seg{N}.mp4
         m = re.match(r"segment_transition_seg(\d+)\.mp4$", fname, re.IGNORECASE)
         if m:
             return (0, int(m.group(1)), fname)
@@ -1175,12 +1124,10 @@ async def sqr_list_videos(request):
 
 @server.PromptServer.instance.routes.get("/sqr/video_thumb")
 async def sqr_video_thumb(request):
-    """返回视频第一帧的缩略图（base64 PNG）"""
     import base64, io
     fpath = request.rel_url.query.get("file", "").strip()
     if not fpath:
         return web.Response(status=400)
-    # 支持绝对路径和相对路径（相对于 input/ 或 output/）
     if not os.path.isabs(fpath):
         for d in [folder_paths.get_input_directory(), folder_paths.get_output_directory()]:
             p = os.path.join(d, fpath)
@@ -1196,7 +1143,6 @@ async def sqr_video_thumb(request):
         cap.release()
         if not ok:
             return web.Response(status=404)
-        # 缩小到宽度 160
         h, w = frame.shape[:2]
         new_w = 160
         new_h = int(h * new_w / w)
@@ -1212,7 +1158,6 @@ async def sqr_video_thumb(request):
 
 @server.PromptServer.instance.routes.get("/sqr/browse_videos")
 async def sqr_browse_videos(request):
-    """浏览任意目录，返回子文件夹列表和视频文件列表"""
     import re
     vid_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
@@ -1220,6 +1165,9 @@ async def sqr_browse_videos(request):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
     def sort_key(fname):
+        m = re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
+        if m:
+            return (0, int(m.group(1)), fname)
         m = re.match(r"segment_transition_seg(\d+)\.mp4$", fname, re.IGNORECASE)
         if m:
             return (0, int(m.group(1)), fname)
@@ -1230,7 +1178,6 @@ async def sqr_browse_videos(request):
 
     import platform, string as _str
 
-    # 「此电脑」虚拟入口：展开为所有盘符
     if req_path == "__drives__":
         drives = []
         if platform.system() == "Windows":
@@ -1286,11 +1233,14 @@ async def sqr_image_thumb(request):
     fname = request.rel_url.query.get("file", "")
     if not fname:
         return web.Response(status=400)
-    # 支持完整路径（文件浏览器模式）和纯文件名（旧模式，从 input/ 目录取）
     if os.path.isabs(fname):
         path = os.path.realpath(fname)
     else:
         path = os.path.join(folder_paths.get_input_directory(), fname)
     if not os.path.isfile(path):
         return web.Response(status=404)
-    return web.FileResponse(path)
+    return web.FileResponse(path, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
