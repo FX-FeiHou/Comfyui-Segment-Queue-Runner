@@ -21,10 +21,15 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 ## 📢 Changelog
 
 ### [v2.0] - 2026-04-03
-**New Feature: Multi-Task Queue Support**
-- **Simultaneous Submission**: Support for submitting multiple generation tasks at once.
-- **Random Interleaved Segmented Sampling**: Tasks are automatically segmented and executed using a random interleaved sampling strategy.
-- **Dynamic Priority Merging**: Implementation of a "first-finished, first-merged" policy, ensuring that tasks completed earlier are merged first to optimize workflow efficiency.
+**Core Update: Multi-Task Parallel Queue Support**
+- **New Task Queue**: Support for simultaneous submission of multiple generation tasks.
+- **Random Interleaved Sampling**: Implemented random interleaved sampling logic between different tasks.
+- **Dynamic Priority Merging**: "First-finished, first-merged" strategy to optimize workflow.
+
+**Bug Fixes:**
+- **Fixed Preview Error**: Resolved the issue where previews in the image selection box displayed incorrectly.
+- **Fixed Segment Misalignment**: Corrected the potential misalignment between segmented samples during multi-task parallel processing.
+- **Fixed Video Overwriting**: Resolved a critical bug where final video merges could be overwritten during multi-task execution.
 
 ## 🚀 Quick Start
 1. Connect frame_count and fps from Load Video to this node
