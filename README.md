@@ -39,7 +39,7 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 - ffmpeg missing: Install ffmpeg and add to system PATH
 
 ## 👥 Authors
-FX-FeiHou
+FX-FeiHou &XueZi
 
 ## 📄 License
 MIT License
