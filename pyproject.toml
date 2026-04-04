@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-segment-queue-runner"
 version = "2.0.0"
-description = "支持多任务并行队列与随机交叉采样的分段运行器。"
+description = "Support multi-task parallel queue."
 authors = [{name = "FeiHou"}]
 license = "MIT"
 dependencies = []
@@ -10,5 +10,5 @@ dependencies = []
 Repository = "https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner"
 
 [tool.comfy]
-PublisherId = "FX-FeiHou"
-DisplayName = "Segment Queue Runner"
+PublisherId = "fx-feihou"
+DisplayName = "Segment-Queue-Runner"
