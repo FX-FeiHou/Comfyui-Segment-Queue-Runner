@@ -2,7 +2,7 @@
 ComfyUI 分段自动队列节点 - 最终版
 """
 
-import math, copy, json, time, os, threading, urllib.request, hashlib, uuid
+import math, copy, json, time, os, threading, urllib.request, urllib.error, hashlib, socket
 import server, folder_paths
 from aiohttp import web
 
@@ -27,6 +27,19 @@ def _sqr_log(uid, msg):
 
 def _sqr_log_clear(uid):
     _sqr_log_buf.pop(str(uid), None)
+
+
+def _sqr_format_exc(e: Exception) -> str:
+    return f"{type(e).__name__}: {e}"
+
+
+def _sqr_log_cv2_issue(uid, scene: str, e: Exception):
+    detail = _sqr_format_exc(e)
+    if isinstance(e, ModuleNotFoundError) and getattr(e, "name", "") == "cv2":
+        _sqr_log(uid, f"[SQR] ✗ {scene}: {detail}")
+        _sqr_log(uid, "[SQR] ✗ 未安装 cv2 / opencv-python，请安装插件 requirements.txt 中的依赖后重启 ComfyUI。")
+    else:
+        _sqr_log(uid, f"[SQR] ✗ {scene}: {detail}")
 
 
 def calc_segments(total_frames: int, segments: int) -> list:
@@ -86,8 +99,168 @@ def clear_checkpoint(unique_id):
         pass
 
 
+def _sqr_is_managed_ref_path(path: str | None, unique_id=None) -> bool:
+    base = os.path.basename(str(path or ""))
+    if not base:
+        return False
+    prefixes = ["sqr_refkeep_", "sqr_refsnap_"]
+    if unique_id:
+        prefixes = [f"sqr_refkeep_{unique_id}_", f"sqr_refsnap_{unique_id}_"]
+    return any(base.startswith(pref) for pref in prefixes)
+
+
+def _sqr_cleanup_ref_images(paths, unique_id=None, keep_paths=None):
+    keep = {os.path.realpath(str(p)) for p in (keep_paths or []) if p}
+    input_dir = os.path.realpath(folder_paths.get_input_directory())
+    for raw in paths or []:
+        p = str(raw or "").strip()
+        if not p or not _sqr_is_managed_ref_path(p, unique_id=unique_id):
+            continue
+        real = os.path.realpath(p)
+        if real in keep:
+            continue
+        try:
+            if os.path.commonpath([real, input_dir]) != input_dir:
+                continue
+        except Exception:
+            continue
+        try:
+            if os.path.exists(real):
+                os.remove(real)
+                print(f"[SQR] 已清理 checkpoint 参考图: {os.path.basename(real)}")
+        except Exception:
+            pass
+
+
+def _sqr_prepare_checkpoint_ref_images(ref_images_list, unique_id=None):
+    if not ref_images_list:
+        return []
+    input_dir = folder_paths.get_input_directory()
+    os.makedirs(input_dir, exist_ok=True)
+    keep_list = []
+    stamp = _sqr_now_stamp()
+    import shutil as _snap_shutil
+    for idx, raw in enumerate(ref_images_list, start=1):
+        src = _sqr_resolve_media_path(raw) or str(raw or "").strip()
+        if not src:
+            continue
+        src_real = os.path.realpath(src)
+        if _sqr_is_managed_ref_path(src_real, unique_id=unique_id) and os.path.isfile(src_real):
+            keep_list.append(src_real)
+            continue
+        if os.path.isfile(src_real):
+            keep_name = f"sqr_refkeep_{unique_id}_{stamp}_{idx:02d}_{os.path.basename(src_real)}" if unique_id else f"sqr_refkeep_{stamp}_{idx:02d}_{os.path.basename(src_real)}"
+            keep_dst = os.path.join(input_dir, keep_name)
+            try:
+                _snap_shutil.copy2(src_real, keep_dst)
+                keep_list.append(keep_dst)
+            except Exception as e:
+                print(f"[SQR] ⚠ 参考图持久化失败({os.path.basename(src_real)}): {e}")
+                keep_list.append(src_real)
+        else:
+            keep_list.append(str(raw))
+    return keep_list
+
+_SQR_COMFY_HOST_CACHE = None
+
+
+def _sqr_now_stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+
+
+def _sqr_transition_seg_from_name(fname: str):
+    import re
+    patterns = [
+        r"^sqr_trans_[0-9_]+_seg(\d+)\.mp4$",
+        r"^sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$",
+        r"^segment_transition_seg(\d+)\.mp4$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, fname, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _sqr_unique_filepath(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    while True:
+        cand = f"{base}_{_sqr_now_stamp()}{ext}"
+        if not os.path.exists(cand):
+            return cand
+        time.sleep(0.002)
+
+
+def _sqr_collect_comfy_hosts() -> list[str]:
+    candidates = []
+    seen = set()
+
+    def add(host, port):
+        if port in (None, ""):
+            return
+        try:
+            port = int(port)
+        except Exception:
+            return
+        host = str(host or "").strip()
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"
+        if host.startswith("http://") or host.startswith("https://"):
+            host = host.split("://", 1)[1]
+        host = host.strip("/ ")
+        key = f"{host}:{port}"
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    inst = getattr(getattr(server, "PromptServer", None), "instance", None)
+    if inst is not None:
+        add(getattr(inst, "address", None), getattr(inst, "port", None))
+        add(getattr(inst, "host", None), getattr(inst, "port", None))
+        srv = getattr(inst, "server", None)
+        if srv is not None:
+            add(getattr(srv, "address", None), getattr(srv, "port", None))
+            add(getattr(srv, "host", None), getattr(srv, "port", None))
+
+    add(os.environ.get("COMFYUI_HOST"), os.environ.get("COMFYUI_PORT"))
+    add(os.environ.get("SERVER_HOST"), os.environ.get("SERVER_PORT"))
+
+    for port in (8188, 8000, 9000, 8080):
+        add("127.0.0.1", port)
+        add("localhost", port)
+    return candidates
+
+
+def _sqr_probe_comfy_host(host: str) -> bool:
+    for ep in ("/system_stats", "/queue", "/object_info", "/features"):
+        try:
+            with urllib.request.urlopen(f"http://{host}{ep}", timeout=1.2) as resp:
+                code = getattr(resp, "status", 200)
+                if code < 500:
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _sqr_get_comfy_host(force_refresh: bool = False) -> str:
+    global _SQR_COMFY_HOST_CACHE
+    if _SQR_COMFY_HOST_CACHE and not force_refresh:
+        return _SQR_COMFY_HOST_CACHE
+    for cand in _sqr_collect_comfy_hosts():
+        if _sqr_probe_comfy_host(cand):
+            _SQR_COMFY_HOST_CACHE = cand
+            return cand
+    _SQR_COMFY_HOST_CACHE = "127.0.0.1:8188"
+    return _SQR_COMFY_HOST_CACHE
+
+
 def _build_safe_input_copy_name(src_path: str, unique_id=None, prefix: str = "sqr_ref") -> str:
-    """为复制到 input/ 的文件生成带来源签名的唯一文件名，避免同名覆盖。"""
     try:
         real = os.path.realpath(src_path)
         st = os.stat(real)
@@ -102,6 +275,111 @@ def _build_safe_input_copy_name(src_path: str, unique_id=None, prefix: str = "sq
     return f"{prefix}_{sig}_{base}"
 
 
+
+
+def _sqr_media_roots() -> list[str]:
+    roots = []
+    seen = set()
+    for getter_name in ("get_input_directory", "get_output_directory", "get_temp_directory"):
+        getter = getattr(folder_paths, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            p = getter()
+        except Exception:
+            continue
+        if not p:
+            continue
+        rp = os.path.realpath(str(p))
+        if rp not in seen:
+            seen.add(rp)
+            roots.append(rp)
+    return roots
+
+
+def _sqr_resolve_media_path(path: str | None) -> str | None:
+    raw = str(path or "").strip().strip('"').strip("'")
+    if not raw:
+        return None
+
+    if os.path.isfile(raw):
+        return os.path.realpath(raw)
+
+    try:
+        ann = folder_paths.get_annotated_filepath(raw)
+        if ann and os.path.isfile(ann):
+            return os.path.realpath(ann)
+    except Exception:
+        pass
+
+    candidates = []
+    seen = set()
+
+    def add_candidate(p):
+        if not p:
+            return
+        rp = os.path.realpath(p)
+        if rp not in seen:
+            seen.add(rp)
+            candidates.append(rp)
+
+    if os.path.isabs(raw):
+        add_candidate(raw)
+    else:
+        add_candidate(raw)
+        base = os.path.basename(raw)
+        for root in _sqr_media_roots():
+            add_candidate(os.path.join(root, raw))
+            if base != raw:
+                add_candidate(os.path.join(root, base))
+
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+
+    base = os.path.basename(raw)
+    if base == raw:
+        for root in _sqr_media_roots():
+            try:
+                for dirpath, _, files in os.walk(root):
+                    if base in files:
+                        return os.path.realpath(os.path.join(dirpath, base))
+            except Exception:
+                continue
+    return None
+
+
+def _sqr_copy_into_input(src_path: str, desired_name: str | None = None,
+                         unique_id=None, prefix: str = "sqr_copy") -> str:
+    src_real = _sqr_resolve_media_path(src_path) or os.path.realpath(str(src_path))
+    if not os.path.isfile(src_real):
+        raise FileNotFoundError(src_path)
+
+    input_dir = folder_paths.get_input_directory()
+    os.makedirs(input_dir, exist_ok=True)
+
+    if os.path.realpath(os.path.dirname(src_real)) == os.path.realpath(input_dir):
+        return src_real
+
+    name = (desired_name or "").strip() or os.path.basename(src_real)
+    dst = os.path.join(input_dir, name)
+
+    try:
+        if os.path.exists(dst) and os.path.samefile(src_real, dst):
+            return dst
+    except Exception:
+        pass
+
+    if os.path.exists(dst):
+        if desired_name:
+            dst = _sqr_unique_filepath(dst)
+        else:
+            safe_name = _build_safe_input_copy_name(src_real, unique_id=unique_id, prefix=prefix)
+            dst = os.path.join(input_dir, safe_name)
+
+    import shutil
+    shutil.copy2(src_real, dst)
+    return dst
 def save_speed_record(total_secs, total_frames_run):
     if total_frames_run <= 0 or total_secs <= 0:
         return
@@ -114,15 +392,19 @@ def save_speed_record(total_secs, total_frames_run):
         pass
 
 
-def build_plan_text(total_frames, segments, start_from_segment, node_id, frame_rate):
+def build_plan_text(total_frames, segments, start_from_segment, node_id, frame_rate,
+                    seg_list_override=None):
     if total_frames <= 0:
         return "✗ total_frames 必须大于 0。"
-    start_from_segment = max(1, min(start_from_segment, segments))
-    seg_list  = calc_segments(total_frames, segments)
+    if seg_list_override is not None:
+        seg_list = seg_list_override
+    else:
+        seg_list = calc_segments(total_frames, segments)
+    start_from_segment = max(1, min(start_from_segment, len(seg_list)))
     start_idx = start_from_segment - 1
     SEP = "═" * 45
     lines = [
-        f"参考视频节点：{node_id}  总帧数：{total_frames}",
+        f"参考视频节点：{node_id}  总帧数：{total_frames}  模式：平均分段",
         f"共 {len(seg_list)} 段，从第 {start_from_segment} 段开始",
         "",
     ]
@@ -172,61 +454,81 @@ def find_animate_embeds_node(prompt: dict) -> str | None:
     return None
 
 
-def queue_prompt(workflow, host="127.0.0.1:8188", client_id="") -> str:
+def queue_prompt(workflow, host=None, client_id="") -> str:
     payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
-    req = urllib.request.Request(
-        f"http://{host}/prompt", data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["prompt_id"]
+    last_err = None
+    for _host in [host or _sqr_get_comfy_host(), _sqr_get_comfy_host(force_refresh=True)]:
+        try:
+            req = urllib.request.Request(
+                f"http://{_host}/prompt", data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())["prompt_id"]
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
-def wait_for_prompt(prompt_id, host="127.0.0.1:8188", poll=5) -> bool:
-    url = f"http://{host}/history/{prompt_id}"
+def wait_for_prompt(prompt_id, host=None, poll=5) -> bool:
     while True:
         time.sleep(poll)
+        for _host in [host or _sqr_get_comfy_host(), _sqr_get_comfy_host(force_refresh=True)]:
+            try:
+                with urllib.request.urlopen(f"http://{_host}/history/{prompt_id}", timeout=10) as resp:
+                    history = json.loads(resp.read())
+                if prompt_id in history:
+                    st = history[prompt_id].get("status", {})
+                    if st.get("completed"):
+                        return True
+                    if st.get("status_str") == "error":
+                        return False
+                    break
+            except Exception:
+                continue
+
+
+def get_output_video_info(prompt_id, combine_node_id, host=None, logger=None):
+    last_err = None
+    for _host in [host or _sqr_get_comfy_host(), _sqr_get_comfy_host(force_refresh=True)]:
         try:
-            with urllib.request.urlopen(url) as resp:
+            with urllib.request.urlopen(f"http://{_host}/history/{prompt_id}", timeout=10) as resp:
                 history = json.loads(resp.read())
-            if prompt_id in history:
-                st = history[prompt_id].get("status", {})
-                if st.get("completed"):   return True
-                if st.get("status_str") == "error": return False
+            node_out = history.get(prompt_id, {}).get("outputs", {}).get(str(combine_node_id), {})
+            gifs = node_out.get("gifs", [])
+            if not gifs:
+                return None, None
+            gi = gifs[0]
+            base_dir = folder_paths.get_output_directory() if gi.get("type") == "output" \
+                       else folder_paths.get_input_directory()
+            subfolder = gi.get("subfolder", "")
+            video_path = os.path.join(base_dir, subfolder, gi["filename"]) if subfolder \
+                         else os.path.join(base_dir, gi["filename"])
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            try:
+                frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else None
+            finally:
+                cap.release()
+            return video_path, frames
+        except Exception as e:
+            last_err = e
+    msg = f"✗ 获取视频信息失败: {_sqr_format_exc(last_err)}" if last_err else "✗ 获取视频信息失败"
+    if logger:
+        logger(msg)
+    else:
+        print(f"[SQR] {msg}")
+    return None, None
+
+
+def interrupt_current(host=None):
+    for _host in [host or _sqr_get_comfy_host(), _sqr_get_comfy_host(force_refresh=True)]:
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"http://{_host}/interrupt", data=b"", method="POST"), timeout=10)
+            return
         except Exception:
-            pass
-
-
-def get_output_video_info(prompt_id, combine_node_id, host="127.0.0.1:8188"):
-    try:
-        with urllib.request.urlopen(f"http://{host}/history/{prompt_id}") as resp:
-            history = json.loads(resp.read())
-        node_out = history.get(prompt_id, {}).get("outputs", {}).get(str(combine_node_id), {})
-        gifs = node_out.get("gifs", [])
-        if not gifs:
-            return None, None
-        gi = gifs[0]
-        base_dir = folder_paths.get_output_directory() if gi.get("type") == "output" \
-                   else folder_paths.get_input_directory()
-        subfolder = gi.get("subfolder", "")
-        video_path = os.path.join(base_dir, subfolder, gi["filename"]) if subfolder \
-                     else os.path.join(base_dir, gi["filename"])
-        import cv2
-        cap = cv2.VideoCapture(video_path)
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else None
-        cap.release()
-        return video_path, frames
-    except Exception as e:
-        print(f"[SQR] ✗ 获取视频信息失败: {e}")
-        return None, None
-
-
-def interrupt_current(host="127.0.0.1:8188"):
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(f"http://{host}/interrupt", data=b"", method="POST"))
-    except Exception:
-        pass
+            continue
 
 
 TRANSITION_FRAMES = 32
@@ -306,9 +608,9 @@ class SegmentQueueRunner:
                     "tooltip": "视频帧率，必须连接 Load Video 的帧率输出。\nFrame rate: must connect to Load Video fps output."}),
                 "总帧数": ("INT", {"default": 0, "min": 0, "max": 99999, "forceInput": True,
                     "tooltip": "参考视频总帧数，必须连接 Load Video 的 frame_count 输出。\nTotal frames: must connect to Load Video frame_count output."}),
-                "分段数": ("INT", {"default": 2, "min": 2, "max": 20,
-                    "tooltip": "分几段处理。\nNumber of segments."}),
-                "从第几段开始": ("INT", {"default": 1, "min": 1, "max": 20,
+                "分段数": ("INT", {"default": 2, "min": 1, "max": 100, "step": 1, "display": "slider",
+                    "tooltip": "平均分段的段数（最大值可在设置处调整）。\nNumber of average segments (max adjustable in settings)."}),
+                "从第几段开始": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "display": "slider",
                     "tooltip": "从第几段开始生成，续跑时填写实际起始段。\nStart from which segment. Set accordingly when resuming."}),
                 "执行": ("BOOLEAN", {"default": False,
                     "tooltip": "关闭=预览分段规划；开启=正式执行。\nOff=preview plan only; On=start execution."}),
@@ -343,7 +645,6 @@ class SegmentQueueRunner:
 
         total_frames       = 总帧数
         segments           = 分段数
-        start_from_segment = max(1, min(从第几段开始, segments))
         node_id            = 参考视频节点ID.strip()
         frame_rate         = 帧率
         combine_nid        = 输出节点ID.strip()
@@ -362,8 +663,11 @@ class SegmentQueueRunner:
         _frame_offset = _frame_offset_param if _frame_offset_param >= 0 else 0
 
         _plan_frames = max(1, total_frames - _frame_offset) if _frame_offset > 0 else total_frames
+
+        _preview_segments = segments
+        start_from_segment = max(1, min(从第几段开始, _preview_segments))
         plan_text = build_plan_text(
-            _plan_frames, segments, start_from_segment, node_id, frame_rate)
+            _plan_frames, _preview_segments, start_from_segment, node_id, frame_rate)
 
         def _do_interrupt():
             try:
@@ -397,18 +701,19 @@ class SegmentQueueRunner:
         _effective_prompt = _sqr_full_prompt if _sqr_full_prompt else prompt
         _need_interrupt = (_sqr_full_prompt is None)
         _client_id = str((extra_pnginfo or {}).get("sqr_client_id") or "")
+        _is_remote = bool((extra_pnginfo or {}).get("sqr_is_remote", False))
 
         if node_id not in (_effective_prompt or {}):
             _sqr_log(unique_id, f"[SQR] ✗ 找不到节点 ID「{node_id}」（完整工作流中）。")
             return {}
 
         print(f"[SQR] sqr_frame_offset: 参数={sqr_frame_offset}, 实际使用={_frame_offset}"
-              f" | 工作流来源={'extra_pnginfo' if _sqr_full_prompt else 'prompt(回退)'}")
-        if _frame_offset > 0:
-            _remaining = max(1, total_frames - _frame_offset)
-            seg_list = calc_segments(_remaining, segments)
-        else:
-            seg_list = calc_segments(total_frames, segments)
+              f" | 工作流来源={'extra_pnginfo' if _sqr_full_prompt else 'prompt(回退)'}"
+              f" | 分段模式=average")
+        _effective_frames = max(1, total_frames - _frame_offset) if _frame_offset > 0 else total_frames
+
+        seg_list = calc_segments(_effective_frames, segments)
+
         start_idx   = start_from_segment - 1
         segs_to_run = seg_list[start_idx:]
         base_prompt = copy.deepcopy(_effective_prompt)
@@ -416,62 +721,39 @@ class SegmentQueueRunner:
         ae_nid = ae_node_id or find_animate_embeds_node(base_prompt) or ""
         vc_nid = find_video_combine_node(base_prompt, combine_nid) or ""
 
-        ref_images_list = [x.strip() for x in ref_imgs_str.split(",") if x.strip()] \
-                          if ref_imgs_str else []
-
-        # ── 参考图快照 ──────────────────────────────────────────────
-        _snap_paths = []
+        ref_images_list = [x.strip() for x in ref_imgs_str.split(",") if x.strip()]                           if ref_imgs_str else []
         if ref_images_list:
-            import shutil as _snap_shutil
-            _snap_ts   = time.strftime('%Y%m%d_%H%M%S')
-            _input_dir = folder_paths.get_input_directory()
-            _snapped   = []
-            for _orig in ref_images_list:
-                _src = _orig if os.path.isabs(_orig) \
-                       else os.path.join(_input_dir, _orig)
-                if os.path.isfile(_src):
-                    _snap_name = f"sqr_refsnap_{unique_id}_{_snap_ts}_{os.path.basename(_orig)}"
-                    _snap_dst  = os.path.join(_input_dir, _snap_name)
-                    if os.path.realpath(_src) != os.path.realpath(_snap_dst):
-                        try:
-                            _snap_shutil.copy2(_src, _snap_dst)
-                            _snapped.append(_snap_dst)
-                            _snap_paths.append(_snap_dst)
-                        except Exception as _se:
-                            print(f"[SQR] ⚠ 参考图快照失败({os.path.basename(_orig)}): {_se}")
-                            _snapped.append(_orig)
-                    else:
-                        _snapped.append(_orig)
-                else:
-                    _snapped.append(_orig)
-            ref_images_list = _snapped
+            ref_images_list = _sqr_prepare_checkpoint_ref_images(ref_images_list, unique_id=unique_id)
 
-        # ── 续跑视频处理 ──
         manual_video_path = manual_video_frames = None
         if resume_enabled and resume_video_path:
-            p = resume_video_path if os.path.isabs(resume_video_path) \
-                else os.path.join(folder_paths.get_input_directory(), resume_video_path)
-            if os.path.isfile(p):
+            p = _sqr_resolve_media_path(resume_video_path)
+            if p and os.path.isfile(p):
                 try:
-                    import shutil as _shutil
-                    input_dir = folder_paths.get_input_directory()
+                    src_p = p
+                    p = _sqr_copy_into_input(p, unique_id=unique_id, prefix="sqr_resume")
+                    if os.path.realpath(src_p) != os.path.realpath(p):
+                        _sqr_log(unique_id, f"[SQR] 已复制续跑视频到 input/: {os.path.basename(p)}")
                     fname = os.path.basename(p)
-                    dst = os.path.join(input_dir, fname)
-                    if os.path.realpath(p) != os.path.realpath(dst):
-                        _shutil.copy2(p, dst)
-                        print(f"[SQR] 已复制续跑视频到 input/: {fname}")
-                        p = dst
                     import cv2
                     cap = cv2.VideoCapture(p)
-                    if cap.isOpened():
-                        manual_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    try:
+                        if not cap.isOpened():
+                            _sqr_log(unique_id, f"[SQR] ✗ cv2 无法打开续跑视频: {fname}")
+                        else:
+                            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            if frames <= 0:
+                                _sqr_log(unique_id, f"[SQR] ✗ 续跑视频帧数异常: {fname} ({frames})")
+                            else:
+                                manual_video_frames = frames
+                                manual_video_path = p
+                                _sqr_log(unique_id, f"[SQR] ✓ 续跑视频: {fname} ({manual_video_frames}帧)")
+                    finally:
                         cap.release()
-                    manual_video_path = p
-                    print(f"[SQR] ✓ 续跑视频: {fname} ({manual_video_frames}帧)")
                 except Exception as e:
-                    print(f"[SQR] ✗ 读取续跑视频失败: {e}")
+                    _sqr_log_cv2_issue(unique_id, "读取续跑视频失败", e)
             else:
-                print(f"[SQR] ⚠ 续跑视频不存在: {p}")
+                _sqr_log(unique_id, f"[SQR] ⚠ 续跑视频不存在或无法解析: {resume_video_path}")
 
         width_src = height_src = None
         target_inputs = base_prompt.get(node_id, {}).get("inputs", {})
@@ -502,23 +784,19 @@ class SegmentQueueRunner:
         if pre_segment_paths:
             print(f"[SQR] 续跑前段素材: {len(pre_segment_paths)} 个文件")
 
-        # ── 每次 run() 生成唯一运行ID，隔离多任务并发的文件名 ──────────
-        # 场景1(多工作流)和场景2(同工作流多队列)都依赖此 run_id 避免文件冲突
-        run_id = uuid.uuid4().hex[:8]
+        run_stamp = _sqr_now_stamp()
 
         def submit_all():
             last_video_path   = manual_video_path
             last_video_frames = manual_video_frames
             segment_output_paths = []
-            # sqr_cut_paths 记录 (dir, prefix) 供清理使用，避免依赖文件名正则
-            sqr_cut_cleanup = []   # list of (search_dir, prefix_str)
-            sqr_cut_paths   = []   # 仅用于合并
+            sqr_cut_cleanup = []
+            sqr_cut_paths   = []
             _t0 = time.time()
             _total_frames_ran = sum(limit for _, limit in segs_to_run)
             _all_done = False
 
-            # 日志分隔符：同一节点(uid)多次队列时区分不同任务
-            log(f"{'═'*20} 运行ID={run_id} {'═'*20}")
+            log(f"{'═'*20} 运行时间码={run_stamp} {'═'*20}")
             log(f"AnimateEmbeds节点: [{ae_nid}]")
             log(f"输出节点: [{vc_nid}]")
             if ref_images_list:
@@ -552,7 +830,6 @@ class SegmentQueueRunner:
                 wf[node_id]["inputs"]["skip_first_frames"] = _actual_skip
                 wf[node_id]["inputs"]["frame_load_cap"]    = limit
 
-                # ── 音频对齐 ──
                 if vc_nid and vc_nid in wf and audio_filename:
                     _real_skip = skip + _frame_offset
                     if use_transition:
@@ -579,7 +856,6 @@ class SegmentQueueRunner:
                     wf[vc_nid]["inputs"]["audio"] = [node_id, 2]
                     log(f"  ⚠ 音频: 无法获取文件名，直接用LoadVideo音频(skip={skip}帧)")
 
-                # ── transition_video 注入 AnimateEmbeds ──
                 if ae_nid and ae_nid in wf:
                     if use_transition:
                         t_skip = skip_frames_manual if skip_frames_manual >= 0 \
@@ -606,7 +882,6 @@ class SegmentQueueRunner:
                         wf[ae_nid]["inputs"].pop("transition_video", None)
                         log(f"  首段无过渡")
 
-                # ── 分段切换参考图 ──
                 if ref_images_list and ri_node_id and ri_node_id in wf:
                     img_idx   = min(i, len(ref_images_list) - 1)
                     img_entry = ref_images_list[img_idx]
@@ -631,7 +906,6 @@ class SegmentQueueRunner:
                     if wv: wv[0] = img_name
                     log(f"  ✓ 参考图[{img_idx+1}]: {img_name}")
 
-                # ── 自动裁切 ──
                 TRIM = 16
                 is_last_seg = (seg_num == total_segs)
                 total_raw = limit + (TRANSITION_FRAMES if use_transition else 0)
@@ -666,7 +940,6 @@ class SegmentQueueRunner:
                     final_image_node = ifb_b
                     log(f"  裁切：裁前{TRIM}裁后{TRIM}→输出{trim_len}帧")
 
-                # ── VHS_VideoCombine 双路输出 ──
                 if vc_nid and vc_nid in wf:
                     wf[vc_nid]["inputs"]["images"] = image_src
 
@@ -678,8 +951,7 @@ class SegmentQueueRunner:
                     _main_prefix = wf[vc_nid]["inputs"].get("filename_prefix", "")
                     _slash = max(_main_prefix.rfind("/"), _main_prefix.rfind("\\"))
                     _subfolder_prefix = _main_prefix[:_slash+1] if _slash >= 0 else ""
-                    # ── 使用 run_id 隔离：不同任务的裁切文件不会同名覆盖 ──
-                    _cut_file_prefix = f"sqr_cut_{run_id[:6]}_{seg_num}_"
+                    _cut_file_prefix = f"sqr_cut_{run_stamp}_seg{seg_num}_"
                     cut_inputs["filename_prefix"] = f"{_subfolder_prefix}{_cut_file_prefix}"
 
                     if audio_filename:
@@ -696,7 +968,6 @@ class SegmentQueueRunner:
                         log(f"  ✓ cut_vc音频: start={audio_skip_frames/frame_rate:.3f}s (={audio_skip_frames}帧)")
 
                     wf[cut_vc_id] = {"class_type": "VHS_VideoCombine", "inputs": cut_inputs}
-                    # 记录清理信息（目录+前缀），不依赖后续文件名解析
                     _cut_search_dir = os.path.join(folder_paths.get_output_directory(),
                                                    _subfolder_prefix.rstrip("/\\")) \
                                       if _subfolder_prefix else folder_paths.get_output_directory()
@@ -714,7 +985,7 @@ class SegmentQueueRunner:
                         log(f"✓ 第{seg_num}段完成")
                         if is_last_seg:
                             _all_done = True
-                        if unique_id:
+                        if unique_id and not _is_remote:
                             _lv_inputs = base_prompt.get(node_id, {}).get("inputs", {})
                             _ref_video_params = {
                                 "video":             _lv_inputs.get("video", ""),
@@ -728,11 +999,10 @@ class SegmentQueueRunner:
                                 _frame_offset_for_resume = _frame_offset + seg_list[_next_seg_idx][0]
                             else:
                                 _frame_offset_for_resume = _frame_offset + (skip + limit)
-                            # ── transition_video 用 run_id 命名，续跑检测时能找到正确文件 ──
-                            _trans_fname = f"sqr_trans_{run_id}_seg{seg_num}.mp4"
+                            _trans_fname = f"sqr_trans_{run_stamp}_seg{seg_num}.mp4"
                             write_checkpoint(unique_id, {
                                 "unique_id":              unique_id,
-                                "run_id":                 run_id,
+                                "run_stamp":                 run_stamp,
                                 "completed_seg":          seg_num,
                                 "total_segs":             total_segs,
                                 "next_seg":               seg_num + 1,
@@ -744,6 +1014,8 @@ class SegmentQueueRunner:
                                 "timestamp":              time.strftime("%Y-%m-%d %H:%M:%S"),
                                 "base_frame_offset":      _frame_offset,
                                 "frame_offset_for_resume": _frame_offset_for_resume,
+                                "total_frames_used":      total_frames,
+                                "frame_rate_used":        frame_rate,
                             })
                         _elapsed = time.time() - _t0
                         _frames_done = sum(lmt for _, lmt in segs_to_run[:i+1])
@@ -751,9 +1023,9 @@ class SegmentQueueRunner:
 
                         cut_vc_id_done = f"sqr_cut_vc_{seg_num}"
                         if vc_nid:
-                            cut_vpath, _ = get_output_video_info(pid, cut_vc_id_done)
+                            cut_vpath, _ = get_output_video_info(pid, cut_vc_id_done, logger=log)
                             if not cut_vpath:
-                                cut_vpath, _ = get_output_video_info(pid, vc_nid)
+                                cut_vpath, _ = get_output_video_info(pid, vc_nid, logger=log)
                             if cut_vpath:
                                 segment_output_paths.append(cut_vpath)
                                 sqr_cut_paths.append(cut_vpath)
@@ -761,15 +1033,13 @@ class SegmentQueueRunner:
                             else:
                                 log(f"  ⚠ 未找到裁切输出视频")
 
-                        # 取完整视频复制为过渡素材，文件名含 run_id，多任务不冲突
-                        vpath, vframes = get_output_video_info(pid, vc_nid) if vc_nid else (None, None)
+                        vpath, vframes = get_output_video_info(pid, vc_nid, logger=log) if vc_nid else (None, None)
                         if not vpath:
                             log(f"  ⚠ 完整视频获取失败，下段过渡将跳过")
                         if vpath:
                             import shutil
                             input_dir   = folder_paths.get_input_directory()
-                            # ── 关键修复：用 run_id 隔离过渡文件，多任务不会互相覆盖 ──
-                            input_fname = f"sqr_trans_{run_id}_seg{seg_num}.mp4"
+                            input_fname = f"sqr_trans_{run_stamp}_seg{seg_num}.mp4"
                             input_path  = os.path.join(input_dir, input_fname)
                             try:
                                 shutil.copy2(vpath, input_path)
@@ -789,7 +1059,6 @@ class SegmentQueueRunner:
                     log(f"✗ 提交失败：{e}")
                     break
 
-            # ── 合并所有段输出视频 ──
             if pre_segment_paths:
                 log(f"续跑合并：前段 {len(pre_segment_paths)} 个 + 本次 {len(segment_output_paths)} 个")
                 segment_output_paths = pre_segment_paths + segment_output_paths
@@ -805,9 +1074,9 @@ class SegmentQueueRunner:
                         os.makedirs(os.path.join(output_dir, _sub.rstrip("/\\")), exist_ok=True)
                 else:
                     _sub = ""
-                # 合并文件名含 run_id，多任务并发时不冲突
-                merged_fname = f"sqr_merged_{run_id}_{time.strftime('%Y%m%d_%H%M%S')}_.mp4"
-                merged_path  = os.path.join(output_dir, _sub + merged_fname)
+                merged_fname = f"sqr_merged_{run_stamp}.mp4"
+                merged_path  = _sqr_unique_filepath(os.path.join(output_dir, _sub + merged_fname))
+                merged_fname = os.path.basename(merged_path)
                 if merge_videos(segment_output_paths, merged_path,
                                target_fps=frame_rate if pre_segment_paths else None):
                     log(f"✓ 合并完成: {_sub + merged_fname}")
@@ -816,7 +1085,6 @@ class SegmentQueueRunner:
             elif len(segment_output_paths) == 1:
                 log(f"只有1段，无需合并")
 
-            # ── 清理临时裁切文件（使用记录的 dir+prefix，无需正则解析文件名）──
             for (_clean_dir, _clean_prefix) in sqr_cut_cleanup:
                 try:
                     if not os.path.isdir(_clean_dir):
@@ -825,7 +1093,6 @@ class SegmentQueueRunner:
                         if not _f.startswith(_clean_prefix):
                             continue
                         _fpath = os.path.join(_clean_dir, _f)
-                        # 保留带 -audio 的 mp4
                         if _f.endswith(".mp4") and "-audio" in _f:
                             continue
                         if _f.endswith(".mp4") or _f.endswith(".png"):
@@ -837,7 +1104,6 @@ class SegmentQueueRunner:
                 except Exception:
                     pass
 
-            # 清理主节点 png
             _sqr_save_png = (str(sqr_save_png).lower() != "false")
             _should_clean_main_png = not _sqr_save_png
             print(f"[SQR] Save png 设置: {sqr_save_png} → {'保留' if _sqr_save_png else '清理'}主节点 png")
@@ -864,23 +1130,18 @@ class SegmentQueueRunner:
             if unique_id:
                 if _all_done:
                     clear_checkpoint(unique_id)
+                    _sqr_cleanup_ref_images(ref_images_list, unique_id=unique_id)
                     print("[SQR] checkpoint 已清除（全部完成）")
                 else:
                     print("[SQR] 任务中断，checkpoint 保留供续跑检测")
 
-            for _sp in _snap_paths:
-                try:
-                    if os.path.exists(_sp):
-                        os.remove(_sp)
-                        print(f"[SQR] 已清理参考图快照: {os.path.basename(_sp)}")
-                except Exception:
-                    pass
-
             log("═══ 全部完成 ═══")
 
-        # 清除旧 checkpoint（本次重新开始）
         if unique_id:
+            _old_ckpt = read_checkpoint(unique_id)
+            _old_refs = _old_ckpt.get("ref_images", []) if isinstance(_old_ckpt, dict) else []
             clear_checkpoint(unique_id)
+            _sqr_cleanup_ref_images(_old_refs, unique_id=unique_id, keep_paths=ref_images_list)
 
         if _frame_offset > 0:
             _mode_header = f"=== 重新设计续跑模式（帧偏移={_frame_offset}，跳过前{_frame_offset}帧）==="
@@ -900,7 +1161,7 @@ class SegmentQueueRunner:
 
 
 NODE_CLASS_MAPPINGS        = {"SegmentQueueRunner": SegmentQueueRunner}
-NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "分段队列 🎬 @肥猴🐵 @雪子❄️ "}
+NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "分段队列 🎬 @肥猴🐵 @wuwu🚂 @雪子❄️ "}
 
 
 # ── 后端 API ─────────────────────────────────────────────────────
@@ -1033,79 +1294,14 @@ async def sqr_list_images(request):
     return web.json_response({"images": files})
 
 
-@server.PromptServer.instance.routes.get("/sqr/browse")
-async def sqr_browse(request):
-    import re
-    img_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-
-    def nat_key(s):
-        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
-    req_path = request.rel_url.query.get("path", "").strip()
-
-    import platform, string as _str
-
-    if req_path == "__drives__":
-        drives = []
-        if platform.system() == "Windows":
-            for d in _str.ascii_uppercase:
-                dp = d + ":\\"
-                if os.path.exists(dp):
-                    drives.append({"label": dp, "path": dp, "is_drive": True})
-        else:
-            drives.append({"label": "/", "path": "/", "is_drive": True})
-        return web.json_response({"type": "roots", "roots": drives})
-
-    if not req_path:
-        starts = []
-        for label, p in [("ComfyUI input", folder_paths.get_input_directory()),
-                         ("ComfyUI output", folder_paths.get_output_directory())]:
-            if os.path.isdir(p):
-                starts.append({"label": label, "path": p})
-        starts.append({"label": "此电脑", "path": "__drives__", "is_virtual": True})
-        home = os.path.expanduser("~")
-        for sub in ["Desktop", "桌面", "Pictures", "图片", "Downloads", "下载"]:
-            p = os.path.join(home, sub)
-            if os.path.isdir(p):
-                starts.append({"label": sub, "path": p})
-        return web.json_response({"type": "roots", "roots": starts})
-
-    req_path = os.path.realpath(req_path)
-    if not os.path.isdir(req_path):
-        return web.json_response({"error": "路径不存在"}, status=400)
-
-    try:
-        entries = os.listdir(req_path)
-    except PermissionError:
-        return web.json_response({"error": "无权限访问"}, status=403)
-
-    folders = sorted([e for e in entries
-                      if os.path.isdir(os.path.join(req_path, e))
-                      and not e.startswith(".")], key=nat_key)
-    images  = sorted([e for e in entries
-                      if os.path.splitext(e)[1].lower() in img_exts], key=nat_key)
-
-    parent = os.path.dirname(req_path) if req_path != os.path.dirname(req_path) else None
-
-    return web.json_response({
-        "type":    "dir",
-        "path":    req_path,
-        "parent":  parent,
-        "folders": folders,
-        "images":  images,
-    })
-
-
 @server.PromptServer.instance.routes.get("/sqr/list_videos")
 async def sqr_list_videos(request):
     import re
     vid_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     def sort_key(fname):
-        # 新命名格式 sqr_trans_{run_id}_seg{N}.mp4 排最前，按段号排序
-        m = re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
+        m = re.match(r"sqr_trans_[0-9_]+_seg(\d+)\.mp4$", fname, re.IGNORECASE) or re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
         if m:
             return (0, int(m.group(1)), fname)
-        # 兼容旧命名格式 segment_transition_seg{N}.mp4
         m = re.match(r"segment_transition_seg(\d+)\.mp4$", fname, re.IGNORECASE)
         if m:
             return (0, int(m.group(1)), fname)
@@ -1124,35 +1320,50 @@ async def sqr_list_videos(request):
 
 @server.PromptServer.instance.routes.get("/sqr/video_thumb")
 async def sqr_video_thumb(request):
-    import base64, io
     fpath = request.rel_url.query.get("file", "").strip()
     if not fpath:
         return web.Response(status=400)
-    if not os.path.isabs(fpath):
-        for d in [folder_paths.get_input_directory(), folder_paths.get_output_directory()]:
-            p = os.path.join(d, fpath)
-            if os.path.isfile(p):
-                fpath = p
-                break
-    if not os.path.isfile(fpath):
+
+    raw_path = fpath
+    fpath = _sqr_resolve_media_path(fpath)
+    if not fpath or not os.path.isfile(fpath):
+        print(f"[SQR] video_thumb: 文件不存在或无法解析: {raw_path}")
         return web.Response(status=404)
+
     try:
         import cv2
         cap = cv2.VideoCapture(fpath)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok:
-            return web.Response(status=404)
+        try:
+            if not cap.isOpened():
+                print(f"[SQR] video_thumb: cv2 无法打开视频: {fpath}")
+                return web.Response(status=404)
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print(f"[SQR] video_thumb: 读取首帧失败: {fpath}")
+                return web.Response(status=404)
+        finally:
+            cap.release()
+
         h, w = frame.shape[:2]
         new_w = 160
         new_h = int(h * new_w / w)
         frame = cv2.resize(frame, (new_w, new_h))
         ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if not ok2:
+            print(f"[SQR] video_thumb: JPEG 编码失败: {fpath}")
             return web.Response(status=500)
-        b64 = base64.b64encode(buf.tobytes()).decode()
+
         return web.Response(body=buf.tobytes(), content_type="image/jpeg")
+
+    except ModuleNotFoundError as e:
+        if getattr(e, "name", "") == "cv2":
+            print("[SQR] video_thumb失败: 未安装 cv2 / opencv-python。请安装 requirements.txt 中的依赖后重启 ComfyUI。")
+        else:
+            print(f"[SQR] video_thumb失败: {_sqr_format_exc(e)}")
+        return web.Response(status=500)
     except Exception as e:
+        print(f"[SQR] video_thumb失败: {_sqr_format_exc(e)}")
         return web.Response(status=500)
 
 
@@ -1160,12 +1371,10 @@ async def sqr_video_thumb(request):
 async def sqr_browse_videos(request):
     import re
     vid_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-
     def nat_key(s):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
     def sort_key(fname):
-        m = re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
+        m = re.match(r"sqr_trans_[0-9_]+_seg(\d+)\.mp4$", fname, re.IGNORECASE) or re.match(r"sqr_trans_[a-f0-9]+_seg(\d+)\.mp4$", fname, re.IGNORECASE)
         if m:
             return (0, int(m.group(1)), fname)
         m = re.match(r"segment_transition_seg(\d+)\.mp4$", fname, re.IGNORECASE)
@@ -1173,11 +1382,8 @@ async def sqr_browse_videos(request):
             return (0, int(m.group(1)), fname)
         parts = re.split(r"(\d+)", fname)
         return (1, 0, tuple(int(p) if p.isdigit() else p.lower() for p in parts))
-
     req_path = request.rel_url.query.get("path", "").strip()
-
     import platform, string as _str
-
     if req_path == "__drives__":
         drives = []
         if platform.system() == "Windows":
@@ -1188,7 +1394,6 @@ async def sqr_browse_videos(request):
         else:
             drives.append({"label": "/", "path": "/", "is_drive": True})
         return web.json_response({"type": "roots", "roots": drives})
-
     if not req_path:
         starts = []
         for label, p in [("ComfyUI input", folder_paths.get_input_directory()),
@@ -1202,23 +1407,19 @@ async def sqr_browse_videos(request):
             if os.path.isdir(p):
                 starts.append({"label": sub, "path": p})
         return web.json_response({"type": "roots", "roots": starts})
-
     req_path = os.path.realpath(req_path)
     if not os.path.isdir(req_path):
         return web.json_response({"error": "路径不存在"}, status=400)
-
     try:
         entries = os.listdir(req_path)
     except PermissionError:
         return web.json_response({"error": "无权限访问"}, status=403)
-
     folders = sorted([e for e in entries
                       if os.path.isdir(os.path.join(req_path, e))
                       and not e.startswith(".")], key=nat_key)
     videos  = sorted([e for e in entries
                       if os.path.splitext(e)[1].lower() in vid_exts], key=sort_key)
     parent  = os.path.dirname(req_path) if req_path != os.path.dirname(req_path) else None
-
     return web.json_response({
         "type":    "dir",
         "path":    req_path,
@@ -1233,14 +1434,15 @@ async def sqr_image_thumb(request):
     fname = request.rel_url.query.get("file", "")
     if not fname:
         return web.Response(status=400)
-    if os.path.isabs(fname):
-        path = os.path.realpath(fname)
-    else:
-        path = os.path.join(folder_paths.get_input_directory(), fname)
-    if not os.path.isfile(path):
+    path = _sqr_resolve_media_path(fname)
+    if not path or not os.path.isfile(path):
         return web.Response(status=404)
     return web.FileResponse(path, headers={
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
         "Expires": "0",
     })
+
+
+
+
