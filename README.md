@@ -20,7 +20,7 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
 ## 📢 Changelog
 
-### [v2.4] - 2026-XX-XX
+### [v2.4] - 2026-04-06
 **Core Update: Adaptive Enhancement & UI/UX Optimization**
 - **ComfyUI Port Auto-Recognition**: Automatically adapt to local usage and remote calls (RH adaptation pending KJ's wrapper node merge)
 - **UI Style Unification**: Modified and unified the style of partial button UI elements

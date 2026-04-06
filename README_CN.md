@@ -20,7 +20,7 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
 ## 📢 更新日志
 
-### [v2.4] - 2026-XX-XX
+### [v2.4] - 2026-04-06
 **核心更新：交互体验与兼容性优化**
 - **ComfyUI 端口自动识别**：自动适配本地使用和远程调用（适配rh还需等kj合并wrapper节点的改动）
 - **UI 样式统一与优化**：部分按钮UI样式修改与统一；执行模式高亮边缘区分，设置里可开关
