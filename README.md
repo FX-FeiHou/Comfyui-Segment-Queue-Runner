@@ -20,6 +20,20 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 
 ## 📢 Changelog
 
+### [v2.4] - 2026-XX-XX
+**Core Update: Adaptive Enhancement & UI/UX Optimization**
+- **ComfyUI Port Auto-Recognition**: Automatically adapt to local usage and remote calls (RH adaptation pending KJ's wrapper node merge)
+- **UI Style Unification**: Modified and unified the style of partial button UI elements
+- **Execution Mode Highlight**: Added edge highlight distinction for execution modes, with toggle switch in settings
+- **Slider UI for Segmentation**: Replaced segment count/start segment input with draggable sliders, optimized maximum segment count settings for better usability
+- **Native Popup Optimization**: Removed redundant built-in selectors, only retained Windows (local) or browser (remote) native popups for selecting images/videos
+- **Reference Image Management**: 
+  - Drag to sort selected reference images (hold left click)
+  - Remove images (right click)
+  - Duplicate images (left click) to reuse the same image multiple times (no need to replace images for unchanged scenes/styles)
+- **File Naming Optimization**: Replaced random run identifiers in `sqr_cut_*`/`sqr_trans_*`/`sqr_merged_*` with sortable timestamps (time code format), maintaining anti-overwrite capability while improving file identification; breakpoint resume logic adapted accordingly
+- **Dependency & Log Enhancement**: Added cv2 missing error logging, specified `opencv-python>=4.8` dependency
+
 ### [v2.0] - 2026-04-03
 **Core Update: Multi-Task Parallel Queue Support**
 - **New Task Queue**: Support for simultaneous submission of multiple generation tasks.
@@ -52,7 +66,7 @@ git clone https://github.com/FX-FeiHou/Comfyui-Segment-Queue-Runner.git
 - ffmpeg missing: Install ffmpeg and add to system PATH
 
 ## 👥 Authors
-FX-FeiHou &XueZi
+FX-FeiHou & XueZi & wuwukaka
 
 ## 📄 License
 MIT License
