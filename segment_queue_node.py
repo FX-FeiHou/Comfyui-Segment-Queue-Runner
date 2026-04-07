@@ -1224,60 +1224,89 @@ async def sqr_get_checkpoint(request):
     return web.json_response({"checkpoint": ckpt})
 
 
-@server.PromptServer.instance.routes.get("/sqr/pick_images")
-async def sqr_pick_images(request):
-    import threading
-    result = {"paths": [], "error": ""}
-    done = threading.Event()
-    def _pick():
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            paths = filedialog.askopenfilenames(
-                title="选择参考图（可多选）",
-                filetypes=[("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp"), ("所有文件", "*.*")]
-            )
-            root.destroy()
-            result["paths"] = list(paths)
-        except Exception as e:
-            result["error"] = str(e)
-        finally:
-            done.set()
-    t = threading.Thread(target=_pick, daemon=True)
-    t.start()
-    done.wait(timeout=120)
-    return web.json_response(result)
+def _sqr_safe_upload_name(input_dir: str, original: str, default_ext: str) -> str:
+    """生成不冲突的安全文件名（保留原扩展名，去除路径分隔符）。"""
+    base = os.path.basename(str(original or "")).strip()
+    if not base:
+        base = f"upload{default_ext}"
+    # 去掉危险字符
+    base = base.replace("\\", "_").replace("/", "_")
+    name, ext = os.path.splitext(base)
+    if not ext:
+        ext = default_ext
+    # 文件名前缀，便于识别 + 避免与已有文件冲突
+    safe = f"sqr_up_{name}{ext}"
+    dst = os.path.join(input_dir, safe)
+    if not os.path.exists(dst):
+        return safe
+    # 加时间戳兜底
+    stamp = _sqr_now_stamp()
+    safe = f"sqr_up_{name}_{stamp}{ext}"
+    return safe
 
 
-@server.PromptServer.instance.routes.get("/sqr/pick_video")
-async def sqr_pick_video(request):
-    import threading
-    result = {"path": "", "error": ""}
-    done = threading.Event()
-    def _pick():
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            path = filedialog.askopenfilename(
-                title="选择续跑视频",
-                filetypes=[("视频文件", "*.mp4 *.mov *.avi *.mkv *.webm"), ("所有文件", "*.*")]
-            )
-            root.destroy()
-            result["path"] = path or ""
-        except Exception as e:
-            result["error"] = str(e)
-        finally:
-            done.set()
-    t = threading.Thread(target=_pick, daemon=True)
-    t.start()
-    done.wait(timeout=120)
-    return web.json_response(result)
+@server.PromptServer.instance.routes.post("/sqr/upload_images")
+async def sqr_upload_images(request):
+    """接收浏览器多文件上传，保存到 ComfyUI input/ 目录。"""
+    saved = []
+    try:
+        input_dir = folder_paths.get_input_directory()
+        os.makedirs(input_dir, exist_ok=True)
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name not in ("files[]", "files", "file"):
+                continue
+            filename = part.filename or ""
+            if not filename:
+                continue
+            safe = _sqr_safe_upload_name(input_dir, filename, ".png")
+            dst = os.path.join(input_dir, safe)
+            try:
+                with open(dst, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk(1024 * 64)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                saved.append(safe)
+            except Exception as e:
+                print(f"[SQR] upload_images 写入失败 {filename}: {e}")
+        return web.json_response({"saved": saved})
+    except Exception as e:
+        print(f"[SQR] upload_images 出错: {_sqr_format_exc(e)}")
+        return web.json_response({"saved": saved, "error": str(e)})
+
+
+@server.PromptServer.instance.routes.post("/sqr/upload_video")
+async def sqr_upload_video(request):
+    """接收浏览器单文件视频上传，保存到 ComfyUI input/ 目录。"""
+    try:
+        input_dir = folder_paths.get_input_directory()
+        os.makedirs(input_dir, exist_ok=True)
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name not in ("file", "files[]", "files"):
+                continue
+            filename = part.filename or ""
+            if not filename:
+                continue
+            safe = _sqr_safe_upload_name(input_dir, filename, ".mp4")
+            dst = os.path.join(input_dir, safe)
+            try:
+                with open(dst, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk(1024 * 256)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                return web.json_response({"saved": safe})
+            except Exception as e:
+                print(f"[SQR] upload_video 写入失败 {filename}: {e}")
+                return web.json_response({"saved": "", "error": str(e)})
+        return web.json_response({"saved": "", "error": "未收到文件"})
+    except Exception as e:
+        print(f"[SQR] upload_video 出错: {_sqr_format_exc(e)}")
+        return web.json_response({"saved": "", "error": str(e)})
 
 
 @server.PromptServer.instance.routes.get("/sqr/list_images")

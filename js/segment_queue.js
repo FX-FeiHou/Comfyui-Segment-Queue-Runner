@@ -701,19 +701,12 @@ app.registerExtension({
             };
 
             const _resumeNative = async () => {
-                if (_sqrIsRemote()) {
+                // 统一走浏览器弹框（避免本地 tkinter 在部分环境下弹不出来）
+                try {
                     const saved = await _sqrPickAndUploadVideo();
                     if (saved) _applyVideo(saved);
                     showVideoManager(result => { if (result) _applyVideo(result); else _clearVideo(); });
-                } else {
-                    try {
-                        const resp = await fetch("/sqr/pick_video");
-                        const data = await resp.json();
-                        if (data.error) throw new Error(data.error);
-                        if (data.path) _applyVideo(data.path);
-                        showVideoManager(result => { if (result) _applyVideo(result); else _clearVideo(); });
-                    } catch(e) { console.warn("[SQR] 续跑原生失败:", e); }
-                }
+                } catch(e) { console.warn("[SQR] 续跑选择失败:", e); }
             };
             const _resumeSelectDirect = () => {
                 _resumeNative();
@@ -808,16 +801,12 @@ app.registerExtension({
             };
 
             const _refNative = async () => {
-                if (_sqrIsRemote()) {
+                // 统一走浏览器弹框（避免本地 tkinter 在部分环境下弹不出来）
+                try {
                     const saved = await _sqrPickAndUploadImages();
                     if (saved.length) { const cur = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean); saved.forEach(name => { if (!cur.includes(name)) cur.push(name); }); setSqr("分段参考图", cur.join(",")); refThumbWidget.syncPaths(); }
                     showRefManager(result => { setSqr("分段参考图", result.join(",")); refThumbWidget.syncPaths(); node.setDirtyCanvas?.(true, true); });
-                } else {
-                    try { const resp = await fetch("/sqr/pick_images"); const data = await resp.json(); if (data.error) throw new Error(data.error);
-                        if (data.paths?.length) { const cur = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean); data.paths.forEach(p => { if (!cur.includes(p)) cur.push(p); }); setSqr("分段参考图", cur.join(",")); refThumbWidget.syncPaths(); }
-                        showRefManager(result => { setSqr("分段参考图", result.join(",")); refThumbWidget.syncPaths(); node.setDirtyCanvas?.(true, true); });
-                    } catch(e) { console.warn("[SQR] 参考图原生失败:", e); }
-                }
+                } catch(e) { console.warn("[SQR] 参考图选择失败:", e); }
             };
             const refBtn = node.addWidget("button", "🖼️  选择参考图", null, () => {
                 _refNative();
@@ -997,8 +986,8 @@ app.registerExtension({
                 const refInfo=mkDiv("（未选，使用当前节点设置）","font-size:11px;opacity:.5;");
                 const refPickBtn=document.createElement("button");refPickBtn.textContent="🖼  选择";refPickBtn.style.cssText="padding:4px 10px;border-radius:5px;cursor:pointer;font-size:12px;";
                 refPickBtn.onclick=async()=>{
-                    if (_sqrIsRemote()) { const saved = await _sqrPickAndUploadImages(); if (saved.length) { newRefs = saved; refInfo.textContent=`已选 ${newRefs.length} 张`; refInfo.style.opacity="1"; } }
-                    else { try{const r=await fetch("/sqr/pick_images");const d=await r.json();if(d.paths?.length){newRefs=d.paths;refInfo.textContent=`已选 ${newRefs.length} 张`;refInfo.style.opacity="1";}}catch(e){} }
+                    // 统一走浏览器弹框
+                    try { const saved = await _sqrPickAndUploadImages(); if (saved.length) { newRefs = saved; refInfo.textContent=`已选 ${newRefs.length} 张`; refInfo.style.opacity="1"; } } catch(e) {}
                 };
                 refRow.append(refPickBtn,refInfo);redesignBody.appendChild(refRow);
                 const confirmRD=document.createElement("button");confirmRD.textContent="✅ 确认重新设计续跑";confirmRD.style.cssText="flex:1;padding:8px 14px;border-radius:7px;cursor:pointer;font-size:13px;background:#2a9;color:#fff;border:none;font-weight:600;margin-top:2px;";
