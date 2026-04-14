@@ -335,7 +335,7 @@ app.registerExtension({
                 const preW = getNodeW("sqr_pre_segments");
                 if (preW) preW.value = "";
 
-                const resumePath = getNodeW("续跑视频路径")?.value || "";
+                const resumePath = getNodeW("resume_video_path")?.value || "";
                 if (resumePath) {
                     const prePaths = await _showPreSegmentDialog(sqrNode);
                     if (prePaths === null) return;
@@ -377,8 +377,8 @@ app.registerExtension({
             const node = this;
             const getW = name => node.widgets?.find(w => w.name === name);
 
-            const sqrKeys = ["参考图节点ID","参考视频节点ID","输出节点ID","动作嵌入节点ID","分段参考图","续跑视频路径"];
-            const resumeToggle = getW("启用续跑");
+            const sqrKeys = ["reference_images_node_id","reference_video_node_id","output_node_id","animate_embeds_node_id","segment_reference_images","resume_video_path"];
+            const resumeToggle = getW("enable_resume");
             if (resumeToggle) { resumeToggle.computeSize = () => [0, -4]; resumeToggle.type = "hidden"; }
             sqrKeys.forEach(k => {
                 const w = getW(k);
@@ -389,8 +389,8 @@ app.registerExtension({
                 if (_spw) { _spw.computeSize = () => [0, -4]; _spw.draw = () => {}; }
             }
 
-            const segW = getW("分段数");
-            const startW = getW("从第几段开始");
+            const segW = getW("segment_count");
+            const startW = getW("start_segment");
 
             function _sqrApplySegMax() {
                 const maxVal = Math.max(2, Math.min(100, node._sqrSettings?.segMax || 100));
@@ -458,7 +458,7 @@ app.registerExtension({
 
             _sqrApplySegMax();
 
-            const execW = getW("执行");
+            const execW = getW("execute");
             if (execW) {
                 execW.draw = function(ctx, nodeRef, w, y, H) {
                     const isExec = !!this.value;
@@ -488,7 +488,7 @@ app.registerExtension({
             node.onDrawBackground = function(ctx) {
                 if (_origDrawBg) _origDrawBg.call(this, ctx);
                 if (!node._sqrSettings?.execGlow) return;
-                const eW = getW("执行");
+                const eW = getW("execute");
                 if (!eW || !eW.value) return;
                 ctx.save();
                 ctx.strokeStyle = "rgba(60,200,130,0.7)";
@@ -614,10 +614,10 @@ app.registerExtension({
             // ── 🔧 设置节点 ID 按钮 ──
             const nodeIdBtn = node.addWidget("button", "🔧  设置节点 ID", null, () => {
                 showNodeIdSelector([
-                    {key:"参考图节点ID",   label:"参考图 LoadImage ID",        tooltip:"LoadImage node ID",              value:getSqr("参考图节点ID")},
-                    {key:"参考视频节点ID", label:"参考视频 Load Video ID",      tooltip:"Load Video (target) node ID",    value:getSqr("参考视频节点ID")},
-                    {key:"输出节点ID",     label:"输出 VHS_VideoCombine ID",    tooltip:"Main output VHS_VideoCombine ID",value:getSqr("输出节点ID")},
-                    {key:"动作嵌入节点ID", label:"WanVideoAnimateEmbeds ID",    tooltip:"WanVideoAnimateEmbeds node ID",  value:getSqr("动作嵌入节点ID")},
+                    {key:"reference_images_node_id",   label:"参考图 LoadImage ID",        tooltip:"LoadImage node ID",              value:getSqr("reference_images_node_id")},
+                    {key:"reference_video_node_id", label:"参考视频 Load Video ID",      tooltip:"Load Video (target) node ID",    value:getSqr("reference_video_node_id")},
+                    {key:"output_node_id",     label:"输出 VHS_VideoCombine ID",    tooltip:"Main output VHS_VideoCombine ID",value:getSqr("output_node_id")},
+                    {key:"animate_embeds_node_id", label:"WanVideoAnimateEmbeds ID",    tooltip:"WanVideoAnimateEmbeds node ID",  value:getSqr("animate_embeds_node_id")},
                 ], result=>{
                     Object.entries(result).forEach(([k,v]) => setSqr(k, v));
                     node.setDirtyCanvas?.(true, true);
@@ -647,7 +647,7 @@ app.registerExtension({
             // ── 已选视频管理弹窗 ──
             const showVideoManager = (onConfirm) => {
                 document.getElementById("sqr-vidmgr-overlay")?.remove();
-                let curPath = getSqr("续跑视频路径") || "";
+                let curPath = getSqr("resume_video_path") || "";
                 const overlay = document.createElement("div");overlay.id = "sqr-vidmgr-overlay";Object.assign(overlay.style, {position:"fixed",inset:"0",zIndex:"10001",background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center"});
                 const box = document.createElement("div");Object.assign(box.style, {background:"var(--comfy-menu-bg,#1e1e1e)",color:"var(--input-text,#eee)",border:"1px solid var(--border-color,#444)",borderRadius:"12px",padding:"18px 22px",width:"480px",display:"flex",flexDirection:"column",gap:"10px",boxShadow:"0 8px 40px rgba(0,0,0,.7)"});
                 const mkDiv=(t,s)=>Object.assign(document.createElement("div"),{textContent:t,style:s||""});
@@ -670,7 +670,7 @@ app.registerExtension({
 
             const _applyVideo = (result) => {
                 if (!result) return;
-                setSqr("续跑视频路径", result);
+                setSqr("resume_video_path", result);
                 const fname = result.split(/[/\\]/).pop();
                 const _availPx = Math.max(40, (node.size?.[0] || 200) - 62);
                 const _tc = document.createElement("canvas").getContext("2d");
@@ -684,7 +684,7 @@ app.registerExtension({
                 if (m) {
                     const seg = parseInt(m[1]) + 1;
                     const maxSeg = segW ? Math.round(segW.value) : 100;
-                    const fromW = getW("从第几段开始");
+                    const fromW = getW("start_segment");
                     if (seg <= maxSeg) {
                         if (fromW) fromW.value = seg;
                         resumeBtn.name = `🎬  ${dispName}  ← 第${seg}段开始`;
@@ -697,7 +697,7 @@ app.registerExtension({
                 }
                 node.setDirtyCanvas?.(true, true);
                 resumeBtn._sqrActive = true;
-                const rtw = getW("启用续跑"); if (rtw) rtw.value = true;
+                const rtw = getW("enable_resume"); if (rtw) rtw.value = true;
             };
 
             const _resumeNative = async () => {
@@ -742,10 +742,10 @@ app.registerExtension({
             };
 
             const _clearVideo = () => {
-                setSqr("续跑视频路径", "");
+                setSqr("resume_video_path", "");
                 resumeBtn._sqrActive = false;
-                const rtw = getW("启用续跑"); if (rtw) rtw.value = false;
-                const fromW2 = getW("从第几段开始");
+                const rtw = getW("enable_resume"); if (rtw) rtw.value = false;
+                const fromW2 = getW("start_segment");
                 if (fromW2) fromW2.value = 1;
                 const foW = getW("sqr_frame_offset"); if (foW) foW.value = -1;
                 resumeBtn.name = "🎬  已清除，从第1段开始";
@@ -767,7 +767,7 @@ app.registerExtension({
             // ── 已选图片管理弹窗 ──
             const showRefManager = (onConfirm) => {
                 document.getElementById("sqr-mgr-overlay")?.remove();
-                const paths = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean);
+                const paths = (getSqr("segment_reference_images")||"").split(",").map(s=>s.trim()).filter(Boolean);
                 let dragIdx = null;
                 const overlay = document.createElement("div");overlay.id = "sqr-mgr-overlay";Object.assign(overlay.style,{position:"fixed",inset:"0",zIndex:"10001",background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center"});
                 const box = document.createElement("div");Object.assign(box.style,{background:"var(--comfy-menu-bg,#1e1e1e)",color:"var(--input-text,#eee)",border:"1px solid var(--border-color,#444)",borderRadius:"12px",padding:"18px 22px",width:"680px",maxHeight:"88vh",display:"flex",flexDirection:"column",gap:"10px",boxShadow:"0 8px 40px rgba(0,0,0,.7)"});
@@ -804,8 +804,8 @@ app.registerExtension({
                 // 统一走浏览器弹框（避免本地 tkinter 在部分环境下弹不出来）
                 try {
                     const saved = await _sqrPickAndUploadImages();
-                    if (saved.length) { const cur = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean); saved.forEach(name => { if (!cur.includes(name)) cur.push(name); }); setSqr("分段参考图", cur.join(",")); refThumbWidget.syncPaths(); }
-                    showRefManager(result => { setSqr("分段参考图", result.join(",")); refThumbWidget.syncPaths(); node.setDirtyCanvas?.(true, true); });
+                    if (saved.length) { const cur = (getSqr("segment_reference_images")||"").split(",").map(s=>s.trim()).filter(Boolean); saved.forEach(name => { if (!cur.includes(name)) cur.push(name); }); setSqr("segment_reference_images", cur.join(",")); refThumbWidget.syncPaths(); }
+                    showRefManager(result => { setSqr("segment_reference_images", result.join(",")); refThumbWidget.syncPaths(); node.setDirtyCanvas?.(true, true); });
                 } catch(e) { console.warn("[SQR] 参考图选择失败:", e); }
             };
             const refBtn = node.addWidget("button", "🖼️  选择参考图", null, () => {
@@ -818,7 +818,7 @@ app.registerExtension({
                 name: "_sqr_ref_thumbs", type: "sqr_thumbs", serialize: false,
                 _paths: [], _loaded: {}, _dragSrc: -1, _dragOver: -1,
                 syncPaths() {
-                    this._paths = (getSqr("分段参考图")||"").split(",").map(s=>s.trim()).filter(Boolean);
+                    this._paths = (getSqr("segment_reference_images")||"").split(",").map(s=>s.trim()).filter(Boolean);
                     const nextLoaded = {};
                     this._paths.forEach(p => { const img = new Image(); img.src = sqrThumbUrl(p); img.onload = () => node.setDirtyCanvas?.(true, true); nextLoaded[p] = img; });
                     this._loaded = nextLoaded;
@@ -847,7 +847,7 @@ app.registerExtension({
                     const lx = pos[0], ly = pos[1], w = node.size[0];
                     if (evt.type === "mousedown" && evt.button === 0) { const i = this._idxAt(lx, ly, w); if (i >= 0) { this._dragSrc = i; this._dragOver = i; return true; } }
                     if (evt.type === "mousemove" && this._dragSrc >= 0) { const i = this._idxAt(lx, ly, w); if (i >= 0) this._dragOver = i; node.setDirtyCanvas?.(true, true); return true; }
-                    if (evt.type === "mouseup" && this._dragSrc >= 0) { const src = this._dragSrc, over = this._dragOver; this._dragSrc = -1; this._dragOver = -1; if (src !== over && over >= 0) { const arr = [...this._paths]; const [m] = arr.splice(src, 1); arr.splice(over, 0, m); setSqr("分段参考图", arr.join(",")); this.syncPaths(); } node.setDirtyCanvas?.(true, true); return true; }
+                    if (evt.type === "mouseup" && this._dragSrc >= 0) { const src = this._dragSrc, over = this._dragOver; this._dragSrc = -1; this._dragOver = -1; if (src !== over && over >= 0) { const arr = [...this._paths]; const [m] = arr.splice(src, 1); arr.splice(over, 0, m); setSqr("segment_reference_images", arr.join(",")); this.syncPaths(); } node.setDirtyCanvas?.(true, true); return true; }
                     return false;
                 }
             };
@@ -855,7 +855,7 @@ app.registerExtension({
 
             setTimeout(() => {
                 refThumbWidget.syncPaths();
-                const p = getSqr("续跑视频路径");
+                const p = getSqr("resume_video_path");
                 if (p) {
                     const fname = p.split(/[/\\]/).pop();
                     const _availPx2 = Math.max(40, (node.size?.[0] || 200) - 62);
@@ -872,7 +872,7 @@ app.registerExtension({
 
             function _getRefVideoParams() {
                 try {
-                    const vidNodeId = getSqr("参考视频节点ID"); if (!vidNodeId) return null;
+                    const vidNodeId = getSqr("reference_video_node_id"); if (!vidNodeId) return null;
                     const vidNode = app.graph?.getNodeById?.(parseInt(vidNodeId)); if (!vidNode) return null;
                     const getW2 = name => vidNode.widgets?.find(w => w.name === name);
                     const videoW = getW2("video") || vidNode.widgets?.[0];
@@ -911,7 +911,7 @@ app.registerExtension({
 
             function _showResumeDialog(ckpt, bannerWidget) {
                 document.getElementById("sqr-ckpt-overlay")?.remove();
-                const curSeg = Number(getW("分段数")?.value ?? ckpt.segments); const segChanged = curSeg !== Number(ckpt.segments);
+                const curSeg = Number(getW("segment_count")?.value ?? ckpt.segments); const segChanged = curSeg !== Number(ckpt.segments);
                 const lvBad = ckpt.ref_video_match === false; const ckptParams = ckpt.ref_video_params || {};
                 const mNames = { video:"参考视频文件", force_rate:"强制帧率", frame_load_cap:"帧数读取上限", skip_first_frames:"跳过前X帧", select_every_nth:"间隔" };
                 const lvStr = (ckpt.ref_video_mismatches||[]).map(k=>mNames[k]||k).join("、");
@@ -935,21 +935,21 @@ app.registerExtension({
                     if (mode === "auto") { const base = typeof ckpt.base_frame_offset === "number" && ckpt.base_frame_offset > 0 ? ckpt.base_frame_offset : -1; fo = base; }
                     else { const redesignFo = typeof ckpt.frame_offset_for_resume === "number" && ckpt.frame_offset_for_resume > 0 ? ckpt.frame_offset_for_resume : -1; fo = redesignFo; }
                     const foW = getW("sqr_frame_offset"); if (foW) foW.value = fo;
-                    setSqr("续跑视频路径", ckpt.transition_video);
-                    const rtw = getW("启用续跑"); if (rtw) rtw.value = true;
+                    setSqr("resume_video_path", ckpt.transition_video);
+                    const rtw = getW("enable_resume"); if (rtw) rtw.value = true;
                     resumeBtn._sqrActive = true; resumeBtn.name = "🎬  " + ckpt.transition_video;
-                    const fromW = getW("从第几段开始"); const segWw = getW("分段数");
+                    const fromW = getW("start_segment"); const segWw = getW("segment_count");
                     if (mode === "auto") {
                         _sqrEnsureSegCapacity(ckpt.segments);
                         if (segWw) segWw.value = ckpt.segments;
                         if (fromW) fromW.value = Math.min(ckpt.next_seg, ckpt.total_segs);
-                        if (lvBad) { try { const vn = app.graph?.getNodeById?.(parseInt(getSqr("参考视频节点ID"))); if (vn) { const sv=(n,v)=>{const w=vn.widgets?.find(w=>w.name===n);if(w)w.value=v;}; sv("video",ckptParams.video);sv("force_rate",ckptParams.force_rate);sv("frame_load_cap",ckptParams.frame_load_cap);sv("skip_first_frames",ckptParams.skip_first_frames);sv("select_every_nth",ckptParams.select_every_nth);vn.setDirtyCanvas?.(true,true); } } catch(e) {} }
-                        if (ckpt.ref_images?.length) { const si = Math.min(ckpt.next_seg-1, ckpt.ref_images.length-1); const sl = ckpt.ref_images.slice(si); if (sl.length) setSqr("分段参考图", sl.join(",")); }
+                        if (lvBad) { try { const vn = app.graph?.getNodeById?.(parseInt(getSqr("reference_video_node_id"))); if (vn) { const sv=(n,v)=>{const w=vn.widgets?.find(w=>w.name===n);if(w)w.value=v;}; sv("video",ckptParams.video);sv("force_rate",ckptParams.force_rate);sv("frame_load_cap",ckptParams.frame_load_cap);sv("skip_first_frames",ckptParams.skip_first_frames);sv("select_every_nth",ckptParams.select_every_nth);vn.setDirtyCanvas?.(true,true); } } catch(e) {} }
+                        if (ckpt.ref_images?.length) { const si = Math.min(ckpt.next_seg-1, ckpt.ref_images.length-1); const sl = ckpt.ref_images.slice(si); if (sl.length) setSqr("segment_reference_images", sl.join(",")); }
                     } else {
                         if (fromW) fromW.value = 1;
                         if (opts.newSegCount) _sqrEnsureSegCapacity(opts.newSegCount);
                         if (opts.newSegCount && segWw) segWw.value = opts.newSegCount;
-                        if (opts.newRefs?.length) setSqr("分段参考图", opts.newRefs.join(","));
+                        if (opts.newRefs?.length) setSqr("segment_reference_images", opts.newRefs.join(","));
                     }
                     if (segWw && startW) { startW.options.max = Math.round(segWw.value); if (startW.value > startW.options.max) startW.value = startW.options.max; }
                     const tw = node.widgets?.find(w=>w.name==="_sqr_ref_thumbs"); if (tw) tw.syncPaths?.();
@@ -978,7 +978,7 @@ app.registerExtension({
                 const segRow=document.createElement("div");segRow.style.cssText="display:flex;align-items:center;gap:8px;";
                 segRow.appendChild(mkDiv("续跑部分分段数：","font-size:12px;flex-shrink:0;"));
                 const segInp=document.createElement("input");segInp.type="number";segInp.min="1";segInp.max="100";
-                segInp.value=String(getW("分段数")?.value??ckpt.segments);
+                segInp.value=String(getW("segment_count")?.value??ckpt.segments);
                 Object.assign(segInp.style,{width:"60px",padding:"4px 8px",borderRadius:"5px",fontSize:"13px",background:"var(--comfy-input-bg,#333)",color:"var(--input-text,#eee)",border:"1px solid var(--border-color,#555)"});
                 segRow.appendChild(segInp);redesignBody.appendChild(segRow);
                 const refRow=document.createElement("div");refRow.style.cssText="display:flex;align-items:center;gap:8px;flex-wrap:wrap;";

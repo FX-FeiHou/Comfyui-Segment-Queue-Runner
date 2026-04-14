@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-segment-queue-runner"
-version = "2.5.0"
+version = "2.5.1"
 description = "Support multi-task parallel queue."
 authors = [{name = "FeiHou"}]
 license = "MIT"

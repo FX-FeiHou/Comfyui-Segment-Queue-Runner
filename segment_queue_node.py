@@ -604,56 +604,69 @@ class SegmentQueueRunner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "帧率": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 120.0, "forceInput": True,
-                    "tooltip": "视频帧率，必须连接 Load Video 的帧率输出。\nFrame rate: must connect to Load Video fps output."}),
-                "总帧数": ("INT", {"default": 0, "min": 0, "max": 99999, "forceInput": True,
-                    "tooltip": "参考视频总帧数，必须连接 Load Video 的 frame_count 输出。\nTotal frames: must connect to Load Video frame_count output."}),
-                "分段数": ("INT", {"default": 2, "min": 1, "max": 100, "step": 1, "display": "slider",
-                    "tooltip": "平均分段的段数（最大值可在设置处调整）。\nNumber of average segments (max adjustable in settings)."}),
-                "从第几段开始": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "display": "slider",
-                    "tooltip": "从第几段开始生成，续跑时填写实际起始段。\nStart from which segment. Set accordingly when resuming."}),
-                "执行": ("BOOLEAN", {"default": False,
-                    "tooltip": "关闭=预览分段规划；开启=正式执行。\nOff=preview plan only; On=start execution."}),
-                "启用续跑": ("BOOLEAN", {"default": False,
-                    "tooltip": "开启后使用上方选择的视频作为首段过渡起点。\nEnable resume: use selected video as transition source for first segment."}),
-                "参考视频节点ID": ("STRING", {"default": ""}),
-                "输出节点ID":     ("STRING", {"default": ""}),
-                "动作嵌入节点ID": ("STRING", {"default": ""}),
-                "参考图节点ID":   ("STRING", {"default": ""}),
-                "分段参考图":     ("STRING", {"default": ""}),
-                "续跑视频路径":   ("STRING", {"default": ""}),
-                "sqr_save_png":      ("STRING", {"default": "true"}),
-                "sqr_frame_offset":  ("INT",    {"default": -1}),
-                "sqr_pre_segments":  ("STRING", {"default": ""}),
+                "frame_rate": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 120.0, "forceInput": True,
+                    "tooltip": "Video frame rate. Connect this to the fps output of Load Video."}),
+                "total_frames": ("INT", {"default": 0, "min": 0, "max": 99999, "forceInput": True,
+                    "tooltip": "Total number of frames in the reference video. Connect this to the frame_count output of Load Video."}),
+                "segment_count": ("INT", {"default": 2, "min": 1, "max": 100, "step": 1, "display": "slider",
+                    "tooltip": "Number of evenly divided segments. The maximum can be adjusted in settings."}),
+                "start_segment": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "display": "slider",
+                    "tooltip": "Segment number to start from. Set this to the actual start segment when resuming."}),
+                "execute": ("BOOLEAN", {"default": False,
+                    "tooltip": "Off = preview the segment plan only. On = start execution."}),
+                "enable_resume": ("BOOLEAN", {"default": False,
+                    "tooltip": "When enabled, use the selected video above as the transition source for the first segment."}),
+                "reference_video_node_id": ("STRING", {"default": ""}),
+                "output_node_id":          ("STRING", {"default": ""}),
+                "animate_embeds_node_id":  ("STRING", {"default": ""}),
+                "reference_images_node_id": ("STRING", {"default": ""}),
+                "segment_reference_images": ("STRING", {"default": ""}),
+                "resume_video_path":       ("STRING", {"default": ""}),
+                "sqr_save_png":            ("STRING", {"default": "true"}),
+                "sqr_frame_offset":        ("INT",    {"default": -1}),
+                "sqr_pre_segments":        ("STRING", {"default": ""}),
+
             },
             "hidden": {
-                "过渡跳过帧数": ("INT", {"default": -1}),
+                "transition_skip_frames": ("INT", {"default": -1}),
                 "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID",
+
             },
         }
 
     def run(self,
-            总帧数, 帧率, 分段数, 从第几段开始,
-            执行, 启用续跑,
-            参考视频节点ID, 输出节点ID, 动作嵌入节点ID, 参考图节点ID,
-            分段参考图, 续跑视频路径,
+            total_frames=None, frame_rate=None, segment_count=None, start_segment=None,
+            execute=None, enable_resume=None,
+            reference_video_node_id=None, output_node_id=None, animate_embeds_node_id=None, reference_images_node_id=None,
+            segment_reference_images=None, resume_video_path=None,
             sqr_save_png="true",
             sqr_frame_offset=-1,
             sqr_pre_segments="",
-            过渡跳过帧数=-1,
-            prompt=None, extra_pnginfo=None, unique_id=None):
+            transition_skip_frames=-1,
+            prompt=None, extra_pnginfo=None, unique_id=None, **legacy_kwargs):
 
-        total_frames       = 总帧数
-        segments           = 分段数
-        node_id            = 参考视频节点ID.strip()
-        frame_rate         = 帧率
-        combine_nid        = 输出节点ID.strip()
-        ae_node_id         = 动作嵌入节点ID.strip()
-        resume_video_path  = 续跑视频路径.strip()
-        resume_enabled     = bool(resume_video_path)
-        skip_frames_manual = 过渡跳过帧数
-        ri_node_id         = 参考图节点ID.strip()
-        ref_imgs_str       = 分段参考图.strip()
+        total_frames = int(total_frames if total_frames is not None else legacy_kwargs.get("总帧数", 0) or 0)
+        frame_rate = float(frame_rate if frame_rate is not None else legacy_kwargs.get("帧率", 0) or 0)
+        segments = int(segment_count if segment_count is not None else legacy_kwargs.get("分段数", 2) or 2)
+        start_segment = int(start_segment if start_segment is not None else legacy_kwargs.get("从第几段开始", 1) or 1)
+        execute = bool(execute if execute is not None else legacy_kwargs.get("执行", False))
+        enable_resume = bool(enable_resume if enable_resume is not None else legacy_kwargs.get("启用续跑", False))
+        reference_video_node_id = str(reference_video_node_id if reference_video_node_id is not None else legacy_kwargs.get("参考视频节点ID", "") or "")
+        output_node_id = str(output_node_id if output_node_id is not None else legacy_kwargs.get("输出节点ID", "") or "")
+        animate_embeds_node_id = str(animate_embeds_node_id if animate_embeds_node_id is not None else legacy_kwargs.get("动作嵌入节点ID", "") or "")
+        reference_images_node_id = str(reference_images_node_id if reference_images_node_id is not None else legacy_kwargs.get("参考图节点ID", "") or "")
+        segment_reference_images = str(segment_reference_images if segment_reference_images is not None else legacy_kwargs.get("分段参考图", "") or "")
+        resume_video_path = str(resume_video_path if resume_video_path is not None else legacy_kwargs.get("续跑视频路径", "") or "")
+        transition_skip_frames = int(transition_skip_frames if transition_skip_frames is not None else legacy_kwargs.get("过渡跳过帧数", -1) or -1)
+
+        node_id            = reference_video_node_id.strip()
+        combine_nid        = output_node_id.strip()
+        ae_node_id         = animate_embeds_node_id.strip()
+        resume_video_path  = resume_video_path.strip()
+        resume_enabled     = bool(resume_video_path or enable_resume)
+        skip_frames_manual = transition_skip_frames
+        ri_node_id         = reference_images_node_id.strip()
+        ref_imgs_str       = segment_reference_images.strip()
 
         _frame_offset_param = sqr_frame_offset if sqr_frame_offset >= 0 else -1
         if _frame_offset_param < 0 and prompt and unique_id:
@@ -665,7 +678,7 @@ class SegmentQueueRunner:
         _plan_frames = max(1, total_frames - _frame_offset) if _frame_offset > 0 else total_frames
 
         _preview_segments = segments
-        start_from_segment = max(1, min(从第几段开始, _preview_segments))
+        start_from_segment = max(1, min(start_segment, _preview_segments))
         plan_text = build_plan_text(
             _plan_frames, _preview_segments, start_from_segment, node_id, frame_rate)
 
@@ -683,7 +696,7 @@ class SegmentQueueRunner:
             except Exception as _e:
                 print(f"[SQR] ⚠ 中断设置失败: {_e}")
 
-        if not 执行:
+        if not execute:
             msg = "[预览模式]\n" + plan_text
             def _pi(): time.sleep(0.005); _do_interrupt()
             threading.Thread(target=_pi, daemon=True).start()
@@ -1161,7 +1174,7 @@ class SegmentQueueRunner:
 
 
 NODE_CLASS_MAPPINGS        = {"SegmentQueueRunner": SegmentQueueRunner}
-NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "分段队列 🎬 @肥猴🐵 @wuwu🚂 @雪子❄️ "}
+NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "Segment Queue Runner 🎬"}
 
 
 # ── 后端 API ─────────────────────────────────────────────────────

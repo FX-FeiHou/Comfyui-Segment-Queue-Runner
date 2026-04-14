@@ -1,0 +1,62 @@
+{
+  "SegmentQueueRunner": {
+    "display_name": "Segment Queue Runner 🎬",
+    "description": "Split a video workflow into queued segments with preview and resume support.",
+    "inputs": {
+      "frame_rate": {
+        "name": "Frame Rate",
+        "tooltip": "Video frame rate. Connect this to the fps output of Load Video."
+      },
+      "total_frames": {
+        "name": "Total Frames",
+        "tooltip": "Total number of frames in the reference video. Connect this to the frame_count output of Load Video."
+      },
+      "segment_count": {
+        "name": "Segment Count",
+        "tooltip": "Number of evenly divided segments. The maximum can be adjusted in settings."
+      },
+      "start_segment": {
+        "name": "Start Segment",
+        "tooltip": "Segment number to start from. Set this to the actual start segment when resuming."
+      },
+      "execute": {
+        "name": "Execute",
+        "tooltip": "Off = preview the segment plan only. On = start execution."
+      },
+      "enable_resume": {
+        "name": "Enable Resume",
+        "tooltip": "When enabled, use the selected video above as the transition source for the first segment."
+      },
+      "reference_video_node_id": {
+        "name": "Reference Video Node ID"
+      },
+      "output_node_id": {
+        "name": "Output Node ID"
+      },
+      "animate_embeds_node_id": {
+        "name": "Animate Embeds Node ID"
+      },
+      "reference_images_node_id": {
+        "name": "Reference Images Node ID"
+      },
+      "segment_reference_images": {
+        "name": "Segment Reference Images"
+      },
+      "resume_video_path": {
+        "name": "Resume Video Path"
+      },
+      "sqr_save_png": {
+        "name": "Save PNG"
+      },
+      "sqr_frame_offset": {
+        "name": "Frame Offset"
+      },
+      "sqr_pre_segments": {
+        "name": "Pre-Segments"
+      },
+      "transition_skip_frames": {
+        "name": "Transition Skip Frames"
+      }
+    }
+  }
+}
