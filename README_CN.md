@@ -38,4 +38,4 @@
 ---
 
 ### 👥 开发者
-* **FeiHou** & **wuwukaka** & **XueZi**
+* **FeiHou** & **wuwukaka** & **XueZi**  
