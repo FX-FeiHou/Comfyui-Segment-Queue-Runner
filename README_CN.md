@@ -1,5 +1,8 @@
 # ComfyUI 分段队列运行器 (Segment Queue Runner)
 
+[🇬🇧 English Version (英文说明)](./README.md)
+
+---
 专为高精度 AI 视频生成、长视频拼接以及流畅卡点变装工作流量身定制的 ComfyUI 自定义节点。提供精准的分段控制、平滑的过渡渲染以及完全自动化的队列续跑机制。
 
 ---

@@ -1,5 +1,7 @@
 # ComfyUI Segment Queue Runner
 
+[🇨🇳 中文说明 (Chinese Version)](./README_CN.md)
+
 A powerful ComfyUI custom node tailored for high-performance AI video generation, long video stitching, and rhythmic outfit-changing workflows. It offers precise segment control, smooth transition rendering, and automated queue execution.
 
 ---
