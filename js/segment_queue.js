@@ -2975,6 +2975,59 @@ function _showLogOverlay(nodeId) {
 }
 
 
+// ── 多批次串行支持 ──────────────────────────────────────────────
+// ComfyUI 的"批次数量"会把同一 prompt 重复提交 N 次。但 SQR 的 run() 会把
+// 真正干活的 submit_all() 丢进后台 daemon 线程后立即返回，若直接提交 N 次，
+// N 个 submit_all 会并发共用同一 unique_id → checkpoint/过渡视频/进度互相覆盖。
+// 因此前端必须在每批提交后，轮询 /sqr/progress 等本批后台 submit_all 跑完，
+// 再提交下一批。
+let _sqrBatchRunning = false;
+
+// 串行等待本批 SQR 节点的后台 submit_all 完成。
+// sqrNodeIds: ["<id>", ...]   prevSnapshots: {id: 提交前的 updated_at}
+async function _sqrWaitForBatchDone(sqrNodeIds, prevSnapshots, opts) {
+    const o = opts || {};
+    const pollMs = Math.max(500, o.pollMs || 2000);
+    const totalTimeoutMs = Math.max(0, o.totalTimeoutMs || 12 * 3600 * 1000);
+    const idleTimeoutMs = Math.max(0, o.idleTimeoutMs || 180 * 1000);
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const deadline = Date.now() + totalTimeoutMs;
+    const snap = Object.assign({}, prevSnapshots || {});
+    let sawAdvance = false;
+    let lastActivityAt = Date.now();
+    while (Date.now() < deadline) {
+        await sleep(pollMs);
+        let allTerminal = sqrNodeIds.length > 0;
+        let anyError = false;
+        for (const id of sqrNodeIds) {
+            let p = {};
+            try {
+                const r = await fetch(`/sqr/progress?uid=${encodeURIComponent(id)}`);
+                if (r.ok) { const d = await r.json(); p = (d && typeof d.progress === "object") ? d.progress : {}; }
+            } catch (e) { /* 忽略单次轮询失败 */ }
+            const ua = Number(p.updated_at) || 0;
+            const prev = Number(snap[id]) || 0;
+            if (ua > prev) {
+                sawAdvance = true;
+                lastActivityAt = Date.now();
+                snap[id] = ua;
+            }
+            const status = String(p.status || "");
+            if (status === "error") anyError = true;
+            if (!(status === "done" || status === "error")) allTerminal = false;
+        }
+        if (allTerminal) return { ok: true, error: anyError, snapshots: snap };
+        // 仅在"从未见到进度推进"时启用空闲超时，防止后端早退导致死等；
+        // 一旦见到推进，后续只受总超时约束（长批次执行不会被误判）。
+        if (!sawAdvance && idleTimeoutMs > 0 && (Date.now() - lastActivityAt) > idleTimeoutMs) {
+            console.warn("[SQR] 批次等待空闲超时：未检测到新进度推进，放行进入下一批（后端可能未启动 submit_all）");
+            return { ok: false, reason: "idle_timeout", snapshots: snap };
+        }
+    }
+    console.warn("[SQR] 批次等待总超时，放行进入下一批");
+    return { ok: false, reason: "total_timeout", snapshots: snap };
+}
+
 app.registerExtension({
     name: "SegmentQueueRunner.UI",
 
@@ -3163,28 +3216,61 @@ app.registerExtension({
             }
 
             let submitResult;
+            const _sqrBatches = Math.max(1, parseInt(batchCount) || 1);
+            const _sqrExecMode = sqrNodes.some(n => !!(n.widgets?.find(w => w.name === "执行")?.value));
+            // 仅在"执行 + 多批次"时串行循环并等待；单次或预览保持原行为
+            const _sqrLoopBatches = _sqrExecMode && _sqrBatches > 1;
+            const _sqrRunCount = _sqrLoopBatches ? _sqrBatches : 1;
+            const _sqrIds = sqrNodes.map(n => String(n.id));
+            if (_sqrLoopBatches && _sqrBatchRunning) {
+                console.warn("[SQR] 批次循环已在运行中，忽略重复的 Queue 调用");
+                return { prompt_id: "sqr_busy_" + Date.now(), number: 0, node_errors: {} };
+            }
+            if (_sqrLoopBatches) _sqrBatchRunning = true;
             try {
-                const { output: fullOutput, workflow: lgWorkflow } = await app.graphToPrompt();
-                const upstreamIds = new Set();
-                for (const sqrNode of sqrNodes) { _sqrCollectUpstream(String(sqrNode.id), fullOutput, upstreamIds); }
-                for (const sqrNode of sqrNodes) { const sqrId = String(sqrNode.id); for (const [nid, ndata] of Object.entries(fullOutput)) { const vals = Object.values(ndata.inputs || {}); if (vals.some(v => Array.isArray(v) && v.length === 2 && String(v[0]) === sqrId)) { upstreamIds.add(nid); } } }
-                const strippedOutput = {};
-                for (const nid of upstreamIds) { if (fullOutput[nid]) strippedOutput[nid] = fullOutput[nid]; }
-                const clientId = api?.clientId ?? app.api?.clientId ?? globalThis.api?.clientId ?? "";
-                if (!clientId) console.warn("[SQR] client_id 为空，分段子任务可能无法显示 WanAnimatePlus 动态采样预览。");
-                const res = await fetch("/prompt", { method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ client_id: clientId, prompt: strippedOutput, extra_data: { extra_pnginfo: { workflow: lgWorkflow, sqr_full_prompt: fullOutput, sqr_client_id: clientId } } }) });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                submitResult = await res.json();
+                for (let _b = 0; _b < _sqrRunCount; _b++) {
+                    // 提交前快照每个 SQR 节点的进度 updated_at，用于判定"本批"是否完成
+                    let _prevSnap = {};
+                    if (_sqrLoopBatches) {
+                        for (const _id of _sqrIds) {
+                            try {
+                                const _r = await fetch(`/sqr/progress?uid=${encodeURIComponent(_id)}`);
+                                if (_r.ok) { const _d = await _r.json(); _prevSnap[_id] = Number(_d?.progress?.updated_at) || 0; }
+                            } catch (e) { _prevSnap[_id] = 0; }
+                        }
+                    }
 
+                    const { output: fullOutput, workflow: lgWorkflow } = await app.graphToPrompt();
+                    const upstreamIds = new Set();
+                    for (const sqrNode of sqrNodes) { _sqrCollectUpstream(String(sqrNode.id), fullOutput, upstreamIds); }
+                    for (const sqrNode of sqrNodes) { const sqrId = String(sqrNode.id); for (const [nid, ndata] of Object.entries(fullOutput)) { const vals = Object.values(ndata.inputs || {}); if (vals.some(v => Array.isArray(v) && v.length === 2 && String(v[0]) === sqrId)) { upstreamIds.add(nid); } } }
+                    const strippedOutput = {};
+                    for (const nid of upstreamIds) { if (fullOutput[nid]) strippedOutput[nid] = fullOutput[nid]; }
+                    const clientId = api?.clientId ?? app.api?.clientId ?? globalThis.api?.clientId ?? "";
+                    if (!clientId) console.warn("[SQR] client_id 为空，分段子任务可能无法显示 WanAnimatePlus 动态采样预览。");
+                    if (_sqrLoopBatches) console.log(`[SQR] 提交第 ${_b + 1}/${_sqrRunCount} 批...`);
+                    const res = await fetch("/prompt", { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ client_id: clientId, prompt: strippedOutput, extra_data: { extra_pnginfo: { workflow: lgWorkflow, sqr_full_prompt: fullOutput, sqr_client_id: clientId } } }) });
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    submitResult = await res.json();
+
+                    // 串行等待本批后台 submit_all 完成，再提交下一批，避免并发冲突
+                    if (_sqrLoopBatches) {
+                        const _w = await _sqrWaitForBatchDone(_sqrIds, _prevSnap, {});
+                        if (!_w.ok) console.warn(`[SQR] 第 ${_b + 1}/${_sqrRunCount} 批等待异常（${_w.reason}），继续`);
+                        else if (_w.error) { console.warn(`[SQR] 第 ${_b + 1}/${_sqrRunCount} 批出错，终止后续批次`); break; }
+                        else console.log(`[SQR] 第 ${_b + 1}/${_sqrRunCount} 批完成`);
+                    }
+                }
             } catch (e) {
                 console.warn("[SQR] 精简提交失败，回退到完整 prompt:", e);
-                submitResult = await origQueuePrompt(number, batchCount);
+                submitResult = await origQueuePrompt(number, 1);
             } finally {
                 for (let i = tempLoadVideoPatches.length - 1; i >= 0; i--) {
                     const item = tempLoadVideoPatches[i];
                     try { _sqrRestoreLoadVideoNode(item.vidNode, item.snapshot); } catch (e) {}
                 }
+                if (_sqrLoopBatches) _sqrBatchRunning = false;
             }
             return submitResult;
         };
@@ -3286,27 +3372,42 @@ app.registerExtension({
                 const _origSegDraw = segW.draw;
                 const _origSegMouse = segW.mouse;
                 const _initVal = segW.value;
-                Object.defineProperty(segW, 'value', {
-                    get() { return this._sqr_val !== undefined ? this._sqr_val : 2; },
-                    set(v) {
-                        if (this._sqrFixedMode) {
-                            let iv = Math.round(v);
-                            iv = Math.round((iv - 1) / 4) * 4 + 1;
-                            const fmin = this.options?.min || 41;
-                            if (iv < fmin) iv = fmin;
-                            const fmax = this.options?.max || 361;
-                            if (iv > fmax) {
-                                iv = Math.floor((fmax - 1) / 4) * 4 + 1;
-                            }
-                            this._sqr_val = iv;
-                        } else {
-                            this._sqr_val = v;
-                        }
-                    },
-                    configurable: true,
-                    enumerable: true,
-                });
+                
+                // 初始化内部变量
                 segW._sqr_val = _initVal ?? 2;
+
+                // 保存原有的回调函数
+                const _originalCallback = segW.callback;
+
+                // 使用 LiteGraph 原生的 callback 来监听数值变化，取代底层的 Object.defineProperty
+                segW.callback = function(v) {
+                    let newValue = v;
+                    
+                    if (this._sqrFixedMode) {
+                        let iv = Math.round(v);
+                        iv = Math.round((iv - 1) / 4) * 4 + 1;
+                        const fmin = this.options?.min || 41;
+                        if (iv < fmin) iv = fmin;
+                        const fmax = this.options?.max || 361;
+                        if (iv > fmax) {
+                            iv = Math.floor((fmax - 1) / 4) * 4 + 1;
+                        }
+                        newValue = iv;
+                    }
+
+                    // 更新内部状态
+                    this._sqr_val = newValue;
+                    
+                    // 如果数值被我们的逻辑修正过，写回原生 value
+                    if (v !== newValue) {
+                        this.value = newValue; 
+                    }
+
+                    // 如果节点原本有回调逻辑，继续执行它
+                    if (_originalCallback) {
+                        return _originalCallback.apply(this, arguments);
+                    }
+                };
             }
 
             if (segW) {

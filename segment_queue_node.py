@@ -2086,9 +2086,11 @@ class SegmentQueueRunner:
 
         if total_frames <= 0:
             _sqr_log(unique_id, "[SQR] ✗ 总帧数必须大于 0。")
+            _sqr_progress_set(unique_id, **_sqr_progress_payload(unique_id, status="error", run_mode="aborted", current_segment=0, total_segments=0, completed_segments=0, current_stage="aborted", execution_scope=_execution_scope, last_message="总帧数必须大于 0"))
             return {}
         if not node_id:
             _sqr_log(unique_id, "[SQR] ✗ 参考视频节点ID 不能为空。")
+            _sqr_progress_set(unique_id, **_sqr_progress_payload(unique_id, status="error", run_mode="aborted", current_segment=0, total_segments=0, completed_segments=0, current_stage="aborted", execution_scope=_execution_scope, last_message="参考视频节点ID 不能为空"))
             return {}
 
         _sqr_full_prompt = (extra_pnginfo or {}).get("sqr_full_prompt")
@@ -2099,6 +2101,7 @@ class SegmentQueueRunner:
 
         if node_id not in (_effective_prompt or {}):
             _sqr_log(unique_id, f"[SQR] ✗ 找不到节点 ID「{node_id}」（完整工作流中）。")
+            _sqr_progress_set(unique_id, **_sqr_progress_payload(unique_id, status="error", run_mode="aborted", current_segment=0, total_segments=0, completed_segments=0, current_stage="aborted", execution_scope=_execution_scope, last_message=f"找不到节点 ID {node_id}"))
             return {}
 
         print(f"[SQR] sqr_frame_offset: 参数={sqr_frame_offset}, 实际使用={_frame_offset}"
@@ -2149,6 +2152,7 @@ class SegmentQueueRunner:
         _seg_errs = _sqr_validate_seg_list(_effective_frames, seg_list, min_seg_frames=_min_seg_frames)
         if _seg_errs:
             _sqr_log(unique_id, "\n".join(f"[SQR] ✗ {x}" for x in _seg_errs))
+            _sqr_progress_set(unique_id, **_sqr_progress_payload(unique_id, status="error", run_mode=_run_mode, current_segment=0, total_segments=max(1, len(seg_list)), completed_segments=0, current_stage="aborted", execution_scope=_execution_scope, last_message="分段校验失败"))
             return {}
         if _runtime_seg_notes:
             _sqr_log(unique_id, "\n".join(f"[SQR] ⚠ {x}" for x in _runtime_seg_notes))
