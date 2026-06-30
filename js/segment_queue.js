@@ -1,3 +1,13 @@
+// Copyright (c) 2026 分段队列
+// 作者 / Authors: B站：三层楼的小肥猴 & wuwukasi
+// 空间 / Bilibili: https://space.bilibili.com/389291683
+// 交流 / Contact: 微信 fx-feihou；QQ群 1091593367（请备注来意：加群、商务）
+// 开源协议 / Open Source License: Apache License 2.0.
+// 中文摘要：可在 Apache-2.0 条款下使用、复制、修改和分发；需保留版权、许可与声明，修改文件需标注变更。
+// English summary: You may use, copy, modify, and distribute this software under Apache-2.0, retaining copyright, license, and notices, and marking changed files.
+// 本软件按“现状”提供；具体条款以 LICENSE 文件为准。
+// Distributed on an "AS IS" BASIS; see the LICENSE file for the full terms.
+
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
@@ -1436,6 +1446,9 @@ function showManualSegmentDialog(totalFrames, frameRate, initialSegList, onConfi
         infoLine.textContent = `总帧数：${totalFrames}  帧率：${frameRate.toFixed(2)}fps  共${splits.length + 1}段  拖竖条调整（自动吸附4n+1，最少${MIN_SEG}帧/段）  滚轮左右滚动  拖四角缩放窗口${selTxt}`;
     }
     box.appendChild(infoLine);
+    if (Array.isArray(videoInfo?.localAlignNotes) && videoInfo.localAlignNotes.length) {
+        box.appendChild(mkDiv(`已自动对齐：${videoInfo.localAlignNotes.join(" ")}`, "font-size:11px;line-height:1.5;color:#f7c66a;flex-shrink:0;"));
+    }
 
     const timelineWrap = document.createElement("div");
     Object.assign(timelineWrap.style, {
@@ -2421,6 +2434,15 @@ function _sqrCalcLoadVideoResult(info, params, ignoreNth = false) {
     };
 }
 
+async function _sqrFetchVideoRealInfo(videoQuery) {
+    const q = String(videoQuery || "").trim();
+    if (!q) return null;
+    const resp = await fetch(`/sqr/video_real_info?file=${encodeURIComponent(q)}`);
+    if (!resp.ok) return null;
+    const info = await resp.json();
+    return info && typeof info === "object" ? info : null;
+}
+
 function _sqrCloneJsonSafe(v) {
     if (v === undefined) return undefined;
     try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
@@ -2567,6 +2589,7 @@ async function _sqrGetVideoRealInfo(sqrNode) {
     const getNodeW = name => sqrNode.widgets?.find(w => w.name === name);
     let totalFrames = 0;
     let frameRate = 0;
+    const alignNotes = [];
 
     try {
         // 1. 找到 Load Video 节点
@@ -2611,10 +2634,9 @@ async function _sqrGetVideoRealInfo(sqrNode) {
         // 3. 调用后端 API 获取视频文件真实信息
         const videoQuery = String(videoFile).trim();
         const fname = videoQuery.split(/[/\\]/).pop();
-        const resp = await fetch(`/sqr/video_real_info?file=${encodeURIComponent(videoQuery)}`);
-        const info = await resp.json();
+        const info = await _sqrFetchVideoRealInfo(videoQuery);
 
-        if (!info.frame_count || info.frame_count <= 0 || !info.fps || info.fps <= 0) {
+        if (!info?.frame_count || info.frame_count <= 0 || !info?.fps || info.fps <= 0) {
             console.warn("[SQR] 视频文件信息无效:", info);
             const guessedTotalFrames = (selectEveryNth > 1 && frameLoadCap > 0) ? frameLoadCap : 0;
             return {
@@ -2627,6 +2649,7 @@ async function _sqrGetVideoRealInfo(sqrNode) {
                 skipFirst,
                 selectEveryNth,
                 frameLoadCap,
+                localAlignNotes: [],
             };
         }
 
@@ -2656,19 +2679,42 @@ async function _sqrGetVideoRealInfo(sqrNode) {
         totalFrames = available;
         frameRate = effectiveFps;
 
+        const localCandidates = [];
+        for (const [key, label] of [["本地姿态视频路径", "姿态"], ["本地人脸视频路径", "人脸"]]) {
+            const localPath = String(getNodeW(key)?.value || "").trim();
+            if (!localPath) continue;
+            const localInfo = await _sqrFetchVideoRealInfo(localPath);
+            if (!localInfo?.frame_count || !localInfo?.fps) continue;
+            const localAvailable = _sqrCalcLoadVideoResult(localInfo, params, true).totalFrames;
+            if (localAvailable > 0) {
+                localCandidates.push({ label, frames: localAvailable });
+            }
+        }
+        if (localCandidates.length > 0) {
+            const localBound = Math.min(...localCandidates.map(x => x.frames));
+            if (localBound > 0 && localBound < totalFrames) {
+                const diff = totalFrames - localBound;
+                const detail = localCandidates.map(x => `${x.label}${x.frames}帧`).join("；");
+                alignNotes.push(diff <= 8
+                    ? `本地姿态/人脸视频仅少 ${diff} 帧，已自动将总帧数对齐到 ${localBound} 帧（${detail}）。`
+                    : `本地姿态/人脸视频比主参考少 ${diff} 帧，已按最短可用帧数对齐到 ${localBound} 帧继续执行（${detail}）。`);
+                totalFrames = localBound;
+            }
+        }
+
         console.log(`[SQR] 视频真实信息: 原始${info.frame_count}帧@${info.fps}fps → 处理后${totalFrames}帧@${frameRate.toFixed(2)}fps`
             + ` (force_rate=${forceRate}, skip=${skipFirst}, nth=${selectEveryNth}, cap=${frameLoadCap})`);
 
         // 返回视频文件信息供帧预览使用
         return { totalFrames, frameRate, file: info.file || videoQuery, originalFps: info.fps, originalTotalFrames: info.frame_count || 0,
-                 forceRate, skipFirst, selectEveryNth, frameLoadCap, displayName: info.name || fname };
+                 forceRate, skipFirst, selectEveryNth, frameLoadCap, displayName: info.name || fname, localAlignNotes: alignNotes };
 
     } catch(e) {
         console.warn("[SQR] 从视频文件获取帧数失败:", e);
     }
 
     return { totalFrames, frameRate, file: "", originalFps: 0, originalTotalFrames: 0,
-             forceRate: 0, skipFirst: 0, selectEveryNth: 1, frameLoadCap: 0 };
+             forceRate: 0, skipFirst: 0, selectEveryNth: 1, frameLoadCap: 0, localAlignNotes: [] };
 }
 
 // ── Helper: silently run a preview to obtain totalFrames ──────────
@@ -3027,6 +3073,18 @@ app.registerExtension({
                         console.warn("[SQR] 续跑视频校验失败:", e);
                     }
                 }
+                if (!resumePath && !resumeMode) {
+                    const resumeToggleW = getNodeW("启用续跑");
+                    if (resumeToggleW) resumeToggleW.value = false;
+                    const resumePathW = getNodeW("续跑视频路径");
+                    if (resumePathW) resumePathW.value = "";
+                    const resumeKindW = getNodeW("sqr_resume_kind");
+                    if (resumeKindW) resumeKindW.value = "";
+                    const preSegmentsW = getNodeW("sqr_pre_segments");
+                    if (preSegmentsW) preSegmentsW.value = "";
+                    const frameOffsetW = getNodeW("sqr_frame_offset");
+                    if (frameOffsetW) frameOffsetW.value = -1;
+                }
 
                 // ── 手动分段模式：读取视频文件真实帧数和帧率，然后弹出timeline调整弹窗 ──
                 const segMode = sqrNode._sqrSettings?.segmentMode || "average";
@@ -3047,23 +3105,24 @@ app.registerExtension({
                     }
                     {
                         const realFramesW = getNodeW("sqr_real_total_frames");
-                        if (realFramesW) realFramesW.value = Number(realInfo.originalTotalFrames || -1);
+                        if (realFramesW) realFramesW.value = String(Number(realInfo.originalTotalFrames || -1));
                         const realFpsW = getNodeW("sqr_real_fps");
-                        if (realFpsW) realFpsW.value = Number(realInfo.originalFps || -1);
+                        if (realFpsW) realFpsW.value = String(Number(realInfo.originalFps || -1));
                     }
                     // 保存视频信息供帧预览使用
-                    const _videoInfoForDialog = {
-                        file: realInfo.file || "",
-                        originalFps: realInfo.originalFps || 0,
-                        forceRate: realInfo.forceRate || 0,
-                        skipFirst: realInfo.skipFirst || 0,
-                        selectEveryNth: realInfo.selectEveryNth || 1,
-                        frameLoadCap: realInfo.frameLoadCap || 0,
-                        _nodeId: String(sqrNode.id),
-                        _skipStoredSplits: resumeMode === "checkpoint_redesign",
-                        // 需求3: 把当前节点设置的固定模式下限传给手动分段对话框
-                        _fixedFrameMin: parseInt(sqrNode._sqrSettings?.fixedFrameMin || 61, 10) || 61,
-                    };
+        const _videoInfoForDialog = {
+            file: realInfo.file || "",
+            originalFps: realInfo.originalFps || 0,
+            forceRate: realInfo.forceRate || 0,
+            skipFirst: realInfo.skipFirst || 0,
+            selectEveryNth: realInfo.selectEveryNth || 1,
+            frameLoadCap: realInfo.frameLoadCap || 0,
+            localAlignNotes: realInfo.localAlignNotes || [],
+            _nodeId: String(sqrNode.id),
+            _skipStoredSplits: resumeMode === "checkpoint_redesign",
+            // 需求3: 把当前节点设置的固定模式下限传给手动分段对话框
+            _fixedFrameMin: parseInt(sqrNode._sqrSettings?.fixedFrameMin || 61, 10) || 61,
+        };
 
                     // ── 回退方案：从 graphToPrompt 解析值 ──
                     if (totalFrames <= 0) {
@@ -3732,7 +3791,7 @@ app.registerExtension({
                     {key:"参考图节点ID",   label:"参考图 LoadImage ID",        tooltip:"LoadImage node ID",               value:getSqr("参考图节点ID")},
                     {key:"参考视频节点ID", label:"参考视频 Load Video ID",      tooltip:"Load Video (target) node ID",     value:getSqr("参考视频节点ID")},
                     {key:"输出节点ID",     label:"输出 VHS_VideoCombine ID",    tooltip:"Main output VHS_VideoCombine ID", value:getSqr("输出节点ID")},
-                    {key:"动作嵌入节点ID", label:"WanAnimatePlus AnimateEmbeds ID", tooltip:"WanAnimatePlus AnimateEmbeds node ID", value:getSqr("动作嵌入节点ID")},
+                    {key:"动作嵌入节点ID", label:"WanAnimatePlus Embeds ID", tooltip:"WanAnimatePlus AnimateEmbeds / SCAIL_2 Embeds node ID", value:getSqr("动作嵌入节点ID")},
                     {key:"姿态模型节点ID", label:"姿态模型节点 ID",              tooltip:"姿态模型节点 ID（如 409）",          value:getSqr("姿态模型节点ID")},
                     {key:"脸部模型节点ID", label:"脸部模型节点 ID",              tooltip:"脸部模型节点 ID（如 346）",          value:getSqr("脸部模型节点ID")},
                     {
@@ -3906,12 +3965,17 @@ app.registerExtension({
             resumeBtn.serialize = false;
             resumeBtn.draw = function(ctx, node, widget_width, y, H) {
                 const active = !!this._sqrActive;
-                ctx.fillStyle = active ? "rgba(40,160,100,0.35)" : "rgba(255,255,255,0.05)";
+                const checkpointPrompt = !!this._sqrCheckpointPrompt;
+                ctx.fillStyle = checkpointPrompt ? "rgba(255,160,0,0.28)" : (active ? "rgba(40,160,100,0.35)" : "rgba(255,255,255,0.05)");
                 ctx.beginPath();
                 ctx.roundRect ? ctx.roundRect(4, y+2, widget_width-8, H-4, 4) : ctx.rect(4, y+2, widget_width-8, H-4);
                 ctx.fill();
-                if (active) { ctx.strokeStyle = "rgba(60,200,130,0.7)"; ctx.lineWidth = 1; ctx.stroke(); }
-                ctx.fillStyle = active ? "#7fffb0" : "rgba(190,190,190,0.5)";
+                if (checkpointPrompt || active) {
+                    ctx.strokeStyle = checkpointPrompt ? "rgba(255,160,0,0.8)" : "rgba(60,200,130,0.7)";
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+                ctx.fillStyle = checkpointPrompt ? "#ffcc00" : (active ? "#7fffb0" : "rgba(190,190,190,0.5)");
                 ctx.font = "12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
                 ctx.fillText(this.name, widget_width/2, y + H/2);
                 ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
@@ -3919,6 +3983,9 @@ app.registerExtension({
 
             const _clearVideo = (opts = {}) => {
                 const silent = !!opts.silent;
+                node._sqrCheckpointBanner = false;
+                node._sqrCheckpointData = null;
+                resumeBtn._sqrCheckpointPrompt = false;
                 _applyResumeState("", {
                     resumeMode: "",
                     keepFrameOffset: !!opts.keepFrameOffset,
@@ -3953,8 +4020,8 @@ app.registerExtension({
             { const w = getW("sqr_manual_splits"); if (w) w.value = ""; }
             { const w = getW("sqr_resume_kind"); if (w) w.value = ""; }
             { const w = getW("sqr_execution_scope"); if (w) w.value = node._sqrSettings?.executionScope || "start_to_end"; }
-            { const w = getW("sqr_real_total_frames"); if (w) w.value = -1; }
-            { const w = getW("sqr_real_fps"); if (w) w.value = -1; }
+            { const w = getW("sqr_real_total_frames"); if (w) w.value = String(w.value || "-1"); }
+            { const w = getW("sqr_real_fps"); if (w) w.value = String(w.value || "-1.0"); }
 
             // ── 已选图片管理弹窗 ──
             const showRefManagerWithPaths = (initialPaths, onConfirm, opts={}) => {
@@ -4155,17 +4222,12 @@ app.registerExtension({
             }
 
             function _showCheckpointBanner(ckpt) {
-                if (node._sqrCheckpointBanner) return; node._sqrCheckpointBanner = true;
-                const bannerBtn = node.addWidget("button", `⚠  上次第${ckpt.completed_seg}/${ckpt.total_segs}段中断 → 点击选择续跑方式`, null, () => _showResumeDialog(ckpt, bannerBtn));
-                bannerBtn.serialize = false;
-                bannerBtn.draw = function(ctx, node, widget_width, y, H) {
-                    ctx.fillStyle = this._hover ? "rgba(255,160,0,0.45)" : "rgba(255,160,0,0.28)";
-                    ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(4, y+2, widget_width-8, H-4, 4); else ctx.rect(4, y+2, widget_width-8, H-4); ctx.fill();
-                    ctx.strokeStyle = "rgba(255,160,0,0.8)"; ctx.lineWidth = 1; ctx.stroke();
-                    ctx.fillStyle = "#ffcc00"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-                    ctx.fillText(this.name, widget_width / 2, y + H / 2); ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
-                };
-                const idx = node.widgets.indexOf(bannerBtn); if (idx > 0) { node.widgets.splice(idx, 1); node.widgets.unshift(bannerBtn); }
+                if (!ckpt) return;
+                node._sqrCheckpointBanner = true;
+                node._sqrCheckpointData = ckpt;
+                resumeBtn._sqrCheckpointPrompt = true;
+                resumeBtn._sqrActive = false;
+                resumeBtn.name = `⚠  上次第${ckpt.completed_seg}/${ckpt.total_segs}段中断 → 点击选择续跑方式`;
                 node.setDirtyCanvas?.(true, true);
             }
 
@@ -4371,11 +4433,9 @@ app.registerExtension({
                     }
                     const tw = node.widgets?.find(w=>w.name==="_sqr_ref_thumbs");
                     if (tw) tw.syncPaths?.();
-                    if (bannerWidget) {
-                        node._sqrCheckpointBanner = false;
-                        const bi = node.widgets?.indexOf(bannerWidget);
-                        if (bi >= 0) node.widgets.splice(bi, 1);
-                    }
+                    node._sqrCheckpointBanner = false;
+                    node._sqrCheckpointData = null;
+                    resumeBtn._sqrCheckpointPrompt = false;
                     overlay.remove();
                     node.setDirtyCanvas?.(true, true);
                 };
@@ -4400,7 +4460,31 @@ app.registerExtension({
                     return card;
                 };
 
-                box.appendChild(mkCard("⊗","关闭续跑","不衔接，全新生成一份","rgba(200,80,80,0.7)", async ()=>{ _clearVideo(); overlay.remove(); }));
+                const abandonResume = async () => {
+                    _clearVideo();
+                    const ckptPath = String(ckpt?.checkpoint_path || "").trim();
+                    if (ckptPath) {
+                        try {
+                            await fetch("/sqr/checkpoints/delete", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ paths: [ckptPath] }),
+                            });
+                        } catch (e) {
+                            console.warn("[SQR] 关闭续跑时删除 checkpoint 失败:", e);
+                        }
+                    }
+                    try {
+                        await fetch(`/sqr/progress/clear?uid=${encodeURIComponent(String(node.id || ""))}`, { method: "POST" });
+                    } catch (e) {}
+                    node._sqrCheckpointBanner = false;
+                    node._sqrCheckpointData = null;
+                    resumeBtn._sqrCheckpointPrompt = false;
+                    resumeBtn.name = "🎬  选择续跑视频";
+                    overlay.remove();
+                    node.setDirtyCanvas?.(true, true);
+                };
+                box.appendChild(mkCard("⊗","关闭续跑","放弃续跑，不衔接，全新生成一份","rgba(200,80,80,0.7)", abandonResume));
                 const autoHints = [];
                 if (state0.segChanged) autoHints.push(`恢复分段数为 ${ckpt.segments} 段`);
                 if (state0.lvBad) autoHints.push("恢复 Load Video 参数");

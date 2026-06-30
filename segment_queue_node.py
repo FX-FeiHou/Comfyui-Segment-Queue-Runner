@@ -1,5 +1,15 @@
+# Copyright (c) 2026 分段队列
+# 作者 / Authors: B站：三层楼的小肥猴 & wuwukasi
+# 空间 / Bilibili: https://space.bilibili.com/389291683
+# 交流 / Contact: 微信 fx-feihou；QQ群 1091593367（请备注来意：加群、商务）
+# 开源协议 / Open Source License: Apache License 2.0.
+# 中文摘要：可在 Apache-2.0 条款下使用、复制、修改和分发；需保留版权、许可与声明，修改文件需标注变更。
+# English summary: You may use, copy, modify, and distribute this software under Apache-2.0, retaining copyright, license, and notices, and marking changed files.
+# 本软件按“现状”提供；具体条款以 LICENSE 文件为准。
+# Distributed on an "AS IS" BASIS; see the LICENSE file for the full terms.
+
 """
-ComfyUI 分段自动队列节点 - 最终版
+ComfyUI 分段自动队列节点 v3.6 版
 """
 
 import math, copy, json, time, os, threading, urllib.request, urllib.error, hashlib, socket, uuid, tempfile
@@ -54,6 +64,8 @@ def _sqr_progress_clear(uid):
 
 MIN_SEG_FRAMES = 41
 _DEFAULT_PROMPT_TIMEOUT_SECS = 12 * 3600
+LOCAL_VIDEO_FRAME_TOLERANCE_FRAMES = 8
+SEGMENT_INTERNAL_READ_PAD_FRAMES = 3
 
 
 def _sqr_nonneg_int(value, default: int = 0) -> int:
@@ -115,7 +127,7 @@ def _sqr_calc_average_segments(total_frames: int, segments: int, min_seg_frames:
                 limit = per_seg
             else:
                 remaining = total_frames - skip
-                limit = _sqr_round_limit_up(remaining)
+                limit = max(1, int(remaining))
             result.append((skip, limit))
         if not result:
             break
@@ -127,7 +139,7 @@ def _sqr_calc_average_segments(total_frames: int, segments: int, min_seg_frames:
             continue
         return result, actual, notes
 
-    return [(0, _sqr_round_limit_up(total_frames))], 1, notes
+    return [(0, max(1, int(total_frames)))], 1, notes
 
 
 def _sqr_calc_manual_seed_segments(total_frames: int, segments: int, min_seg_frames: int = MIN_SEG_FRAMES):
@@ -151,7 +163,7 @@ def _sqr_calc_manual_seed_segments(total_frames: int, segments: int, min_seg_fra
         )
 
     if actual <= 1:
-        return [(0, _sqr_round_limit_manual(total_frames))], 1, notes
+        return [(0, max(1, int(total_frames)))], 1, notes
 
     base_total = actual * min_seg_frames
     extra = max(0, total_frames - base_total)
@@ -172,9 +184,9 @@ def _sqr_calc_manual_seed_segments(total_frames: int, segments: int, min_seg_fra
 
     result = []
     pos = 0
-    for raw_limit in raw_lengths:
+    for idx, raw_limit in enumerate(raw_lengths):
         raw_limit = max(1, int(raw_limit))
-        limit = _sqr_round_limit_manual(raw_limit)
+        limit = raw_limit if idx == actual - 1 else _sqr_round_limit_manual(raw_limit)
         result.append((pos, limit))
         pos += raw_limit
 
@@ -319,7 +331,7 @@ def calc_segments(total_frames: int, segments: int) -> list:
 
 
 def calc_segments_by_fixed(total_frames: int, frames_per_seg: int, min_seg_frames: int = MIN_SEG_FRAMES) -> list:
-    """固定每段帧数模式：每段 frames_per_seg 帧（必须4n+1），最后一段取剩余补到4n+1。
+    """固定每段帧数模式：每段 frames_per_seg 帧（必须4n+1），最后一段保留真实剩余帧数。
     如果剩余不足最小段长则合并到前一段。min_seg_frames 由上层传入（用户设置的下限）。"""
     total_frames = max(0, int(total_frames or 0))
     if total_frames <= 0:
@@ -331,25 +343,25 @@ def calc_segments_by_fixed(total_frames: int, frames_per_seg: int, min_seg_frame
     while pos < total_frames:
         remaining = total_frames - pos
         if remaining <= fps:
-            limit = _sqr_round_limit_up(remaining)
+            limit = max(1, int(remaining))
             if limit < int(min_seg_frames or MIN_SEG_FRAMES) and result:
                 prev_skip, _prev_limit = result[-1]
                 new_remaining = total_frames - prev_skip
-                result[-1] = (prev_skip, _sqr_round_limit_up(new_remaining))
+                result[-1] = (prev_skip, max(1, int(new_remaining)))
             else:
                 result.append((pos, limit))
             break
         result.append((pos, fps))
         pos += fps
     if not result:
-        result.append((0, _sqr_round_limit_up(total_frames)))
+        result.append((0, max(1, int(total_frames))))
     return result
 
 
 def calc_segments_manual(total_frames: int, split_points: list) -> list:
     """手动分段模式：split_points 是用户指定的分段起始帧列表（0-based skip值，不含第一段的0）。
     例如 [109, 202] 表示三段：0-108, 109-201, 202-end。
-    每段 limit 补到 4n+1。"""
+    除最后一段外，limit 补到 4n+1；最后一段保留真实剩余帧数。"""
     total_frames = max(0, int(total_frames or 0))
     if total_frames <= 0:
         return []
@@ -358,7 +370,7 @@ def calc_segments_manual(total_frames: int, split_points: list) -> list:
     for i in range(len(boundaries) - 1):
         skip = boundaries[i]
         raw_limit = boundaries[i + 1] - skip
-        limit = _sqr_round_limit_manual(raw_limit)
+        limit = max(1, int(raw_limit)) if i == len(boundaries) - 2 else _sqr_round_limit_manual(raw_limit)
         result.append((skip, limit))
     return result
 
@@ -924,6 +936,51 @@ def _sqr_prepare_local_video_asset(raw_path: str | None, unique_id=None, prefix:
     return path, _sqr_get_video_cv_info(path)
 
 
+def _sqr_probe_local_video_asset(raw_path: str | None):
+    path = _sqr_resolve_media_path(raw_path)
+    if not path or not os.path.isfile(path):
+        return None, {"frames": None, "fps": None, "width": None, "height": None}
+    return path, _sqr_get_video_cv_info(path)
+
+
+def _sqr_align_total_frames_to_local_assets(
+    total_frames: int,
+    ref_params: dict | None,
+    local_pose_video_info: dict | None = None,
+    local_face_video_info: dict | None = None,
+    tolerance_frames: int = LOCAL_VIDEO_FRAME_TOLERANCE_FRAMES,
+):
+    total_frames = max(0, int(total_frames or 0))
+    if total_frames <= 0:
+        return total_frames, []
+
+    candidates = []
+    for label, info in (("姿态", local_pose_video_info), ("人脸", local_face_video_info)):
+        avail = _sqr_calc_effective_available_frames(info, ref_params)
+        if avail is not None and int(avail) > 0:
+            candidates.append((label, int(avail)))
+
+    if not candidates:
+        return total_frames, []
+
+    local_bound = min(avail for _, avail in candidates)
+    if local_bound >= total_frames:
+        return total_frames, []
+
+    diff = total_frames - local_bound
+    detail = "；".join(f"{label}{avail}帧" for label, avail in candidates)
+    if diff <= int(tolerance_frames or 0):
+        note = f"本地姿态/人脸视频仅少 {diff} 帧，已自动将总帧数对齐到 {local_bound} 帧（{detail}）。"
+    else:
+        note = f"本地姿态/人脸视频比主参考少 {diff} 帧，已按最短可用帧数对齐到 {local_bound} 帧继续执行（{detail}）。"
+    return local_bound, [note]
+
+
+def _sqr_internal_segment_read_cap(limit: int, is_last_seg: bool = False) -> int:
+    limit = max(0, int(limit or 0))
+    return limit if is_last_seg else limit + SEGMENT_INTERNAL_READ_PAD_FRAMES
+
+
 def _sqr_clone_load_video_inputs(
     base_inputs: dict | None,
     video_name: str,
@@ -1186,6 +1243,40 @@ def find_audio_filename(prompt: dict, node_id: str) -> str | None:
 
 
 WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS = "WanAnimatePlus AnimateEmbeds"
+WANANIMATEPLUS_SCAIL2_EMBEDS_CLASS = "WanAnimatePlus SCAIL_2 Embeds"
+WANANIMATEPLUS_SUPPORTED_EMBEDS_LABEL = "WanAnimatePlus AnimateEmbeds / SCAIL_2 Embeds"
+WANANIMATEPLUS_EMBEDS_PROFILES = (
+    {
+        "kind": "wananimate",
+        "label": "WanAnimatePlus AnimateEmbeds",
+        "class_types": {
+            "WanAnimatePlus AnimateEmbeds",
+            "WanAnimatePlus Animate Embeds",
+            "WanVideoAnimateEmbeds",
+            "WanVideo Animate Embeds",
+        },
+        "transition_input": "transition_video",
+        "pose_input": "pose_images",
+        "face_input": "face_images",
+    },
+    {
+        "kind": "scail2",
+        "label": "WanAnimatePlus SCAIL_2 Embeds",
+        "class_types": {
+            "WanAnimatePlus SCAIL_2 Embeds",
+            "WanAnimatePlus SCAIL-2 Embeds",
+            "WanAnimatePlusSCAIL2Embeds",
+        },
+        "transition_input": "transition_video",
+        "pose_input": "pose_images",
+        "face_input": None,
+    },
+)
+WANANIMATEPLUS_EMBEDS_CLASS_TO_PROFILE = {
+    cls_name: profile
+    for profile in WANANIMATEPLUS_EMBEDS_PROFILES
+    for cls_name in profile["class_types"]
+}
 WANANIMATEPLUS_SAMPLER_CLASSES = {
     "WanAnimatePlus Sampler",
     "WanAnimatePlus Samplerv2",
@@ -1193,11 +1284,70 @@ WANANIMATEPLUS_SAMPLER_CLASSES = {
 }
 
 
+def _sqr_get_prompt_node(prompt: dict, node_id):
+    if not isinstance(prompt, dict):
+        return None
+    if node_id in prompt:
+        return prompt.get(node_id)
+    sid = str(node_id)
+    if sid in prompt:
+        return prompt.get(sid)
+    try:
+        iid = int(sid)
+    except Exception:
+        return None
+    return prompt.get(iid)
+
+
+def _sqr_wananimateplus_embeds_profile_from_class(class_type: str) -> dict | None:
+    return WANANIMATEPLUS_EMBEDS_CLASS_TO_PROFILE.get(str(class_type or ""))
+
+
+def _sqr_get_wananimateplus_embeds_profile(prompt: dict, node_id) -> dict | None:
+    node = _sqr_get_prompt_node(prompt, node_id)
+    if not isinstance(node, dict):
+        return None
+    return _sqr_wananimateplus_embeds_profile_from_class(node.get("class_type"))
+
+
+def _sqr_prompt_upstream_ids(prompt: dict, start_id) -> set[str]:
+    stack = [str(start_id)]
+    visited = set()
+    while stack:
+        nid = str(stack.pop())
+        if nid in visited:
+            continue
+        visited.add(nid)
+        node = _sqr_get_prompt_node(prompt, nid)
+        if not isinstance(node, dict):
+            continue
+        for val in (node.get("inputs") or {}).values():
+            if isinstance(val, list) and len(val) == 2:
+                stack.append(str(val[0]))
+    return visited
+
+
 def find_animate_embeds_node(prompt: dict) -> str | None:
+    candidates = []
     for nid, node in prompt.items():
-        if node.get("class_type") == WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS:
-            return nid
-    return None
+        if not isinstance(node, dict):
+            continue
+        profile = _sqr_wananimateplus_embeds_profile_from_class(node.get("class_type"))
+        if profile:
+            candidates.append((str(nid), profile))
+    if not candidates:
+        return None
+
+    sampler_ids = _sqr_find_wananimateplus_sampler_nodes(prompt)
+    if sampler_ids:
+        upstream_ids = set()
+        for sampler_id in sampler_ids:
+            upstream_ids.update(_sqr_prompt_upstream_ids(prompt, sampler_id))
+        for nid, _profile in candidates:
+            if str(nid) in upstream_ids:
+                return nid
+
+    return candidates[0][0]
 
 
 def _sqr_find_wananimateplus_sampler_nodes(prompt: dict) -> list[str]:
@@ -1238,6 +1388,23 @@ def _sqr_prune_prompt_to_roots(prompt_output: dict, root_ids, extra_keep_ids=Non
     pruned = {nid: prompt_output[nid] for nid in prompt_output.keys() if nid in keep}
     removed = [nid for nid in prompt_output.keys() if nid not in keep]
     return pruned, removed
+
+
+def _sqr_rewire_prompt_output(prompt_output: dict, old_node_id, old_slot: int, new_ref, skip_node_ids=None) -> int:
+    if not isinstance(prompt_output, dict):
+        return 0
+    old_id = str(old_node_id)
+    skip = {str(x) for x in (skip_node_ids or [])}
+    replaced = 0
+    for nid, node in prompt_output.items():
+        if str(nid) in skip or not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        for key, val in list(inputs.items()):
+            if isinstance(val, list) and len(val) == 2 and str(val[0]) == old_id and int(val[1]) == int(old_slot):
+                inputs[key] = copy.deepcopy(new_ref)
+                replaced += 1
+    return replaced
 
 
 def _sqr_child_extra_pnginfo(extra_pnginfo: dict | None) -> dict | None:
@@ -1393,6 +1560,22 @@ def _sqr_wananimateplus_output_frames(limit: int, use_transition: bool) -> int:
     expanded = limit + TRANSITION_FRAMES
     aligned = max(0, expanded - ((expanded - 1) % 4))
     return max(0, aligned - TRANSITION_FRAMES)
+
+
+def _sqr_min_input_frames_for_desired_output(desired_frames: int, use_transition: bool, base_input_frames: int | None = None) -> int:
+    desired = max(0, int(desired_frames or 0))
+    cur = max(desired, int(base_input_frames or 0))
+    if desired <= 0:
+        return cur
+    if not use_transition:
+        return max(cur, desired)
+    probe = cur
+    max_probe = cur + max(TRANSITION_FRAMES + 8, 32)
+    while probe <= max_probe:
+        if _sqr_wananimateplus_output_frames(probe, use_transition) >= desired:
+            return probe
+        probe += 1
+    return max(cur, desired)
 
 
 def _sqr_build_trim_plan(seg_num: int, total_segs: int, use_transition: bool, limit: int, real_skip: int, trim_merge_mode: str,
@@ -1603,6 +1786,229 @@ def _sqr_ffprobe_has_audio(video_path: str) -> bool:
     return bool(_sqr_ffprobe_video_info(video_path).get("has_audio"))
 
 
+def _sqr_rewrite_video_to_exact_frames(video_path: str, target_frames: int, fps: float | int | None,
+                                       force_reencode: bool = False) -> tuple[bool, int | None, str]:
+    import shutil
+    import subprocess
+
+    path = str(video_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return False, None, "视频文件不存在"
+
+    target = max(0, int(target_frames or 0))
+    if target <= 0:
+        return False, _sqr_get_video_frame_count(path), "目标帧数无效"
+
+    actual = _sqr_get_video_frame_count(path)
+    if actual is None:
+        return False, None, "无法读取当前视频帧数"
+    if int(actual) == target and not force_reencode:
+        return True, int(actual), "无需修正"
+
+    fps_val = _sqr_positive_float(fps) or _sqr_positive_float(_sqr_ffprobe_video_info(path).get("fps"))
+    if not fps_val or fps_val <= 0:
+        return False, int(actual), "无法确定视频帧率"
+    if shutil.which("ffmpeg") is None:
+        return False, int(actual), "未找到 ffmpeg"
+
+    fps_str = f"{float(fps_val):.9f}".rstrip("0").rstrip(".")
+    pad_frames = max(0, target - int(actual))
+    vf_parts = []
+    if pad_frames > 0:
+        vf_parts.append(f"tpad=stop_mode=clone:stop={pad_frames}")
+    vf_parts.append(f"trim=end_frame={target}")
+    vf_parts.append("setpts=PTS-STARTPTS")
+    vf_expr = ",".join(vf_parts)
+
+    tmp_path = f"{path}.{uuid.uuid4().hex}.fix.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", path,
+        "-vf", vf_expr,
+        "-r", fps_str,
+        "-vsync", "cfr",
+        "-video_track_timescale", "90000",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-an",
+    ]
+    cmd.append(tmp_path)
+
+    try:
+        resp = subprocess.run(cmd, capture_output=True, text=True)
+        if resp.returncode != 0 or not os.path.isfile(tmp_path):
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            err = (resp.stderr or resp.stdout or "ffmpeg failed")[-400:]
+            return False, int(actual), err
+
+        fixed_frames = _sqr_get_video_frame_count(tmp_path)
+        if fixed_frames is None:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return False, int(actual), "修正后无法读取视频帧数"
+
+        os.replace(tmp_path, path)
+        return True, int(fixed_frames), "已修正"
+    except FileNotFoundError:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return False, int(actual), "未找到 ffmpeg"
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return False, int(actual), str(e)
+
+
+def _sqr_extract_video_frame_window(video_path: str, start_frame: int, keep_frames: int,
+                                    fps: float | int | None, output_path: str | None = None) -> tuple[bool, str | None, int | None, str]:
+    import shutil
+    import subprocess
+
+    path = str(video_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return False, None, None, "视频文件不存在"
+    keep = max(0, int(keep_frames or 0))
+    if keep <= 0:
+        return False, None, None, "保留帧数无效"
+    start = max(0, int(start_frame or 0))
+    fps_val = _sqr_positive_float(fps) or _sqr_positive_float(_sqr_ffprobe_video_info(path).get("fps"))
+    if not fps_val or fps_val <= 0:
+        return False, None, None, "无法确定视频帧率"
+    if shutil.which("ffmpeg") is None:
+        return False, None, None, "未找到 ffmpeg"
+
+    out_path = output_path or f"{path}.{uuid.uuid4().hex}.clip.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", path,
+        "-vf", f"trim=start_frame={start}:end_frame={start + keep},setpts=PTS-STARTPTS",
+        "-r", f"{float(fps_val):.9f}".rstrip("0").rstrip("."),
+        "-vsync", "cfr",
+        "-video_track_timescale", "90000",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        out_path,
+    ]
+    try:
+        resp = subprocess.run(cmd, capture_output=True, text=True)
+        if resp.returncode != 0 or not os.path.isfile(out_path):
+            err = (resp.stderr or resp.stdout or "ffmpeg failed")[-400:]
+            return False, None, None, err
+        out_frames = _sqr_get_video_frame_count(out_path)
+        return True, out_path, out_frames, "ok"
+    except FileNotFoundError:
+        return False, None, None, "未找到 ffmpeg"
+    except Exception as e:
+        return False, None, None, str(e)
+
+
+def _sqr_concat_video_clips(video_paths: list[str], output_path: str) -> tuple[bool, str]:
+    import shutil
+    import subprocess
+
+    paths = [str(p) for p in (video_paths or []) if p and os.path.isfile(p)]
+    if not paths:
+        return False, "没有可拼接的视频片段"
+    if shutil.which("ffmpeg") is None:
+        return False, "未找到 ffmpeg"
+
+    list_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            for p in paths:
+                esc = str(p).replace("'", "'\''")
+                f.write(f"file '{esc}'\n")
+            list_path = f.name
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
+        resp = subprocess.run(cmd, capture_output=True, text=True)
+        if resp.returncode != 0 or not os.path.isfile(output_path):
+            return False, (resp.stderr or resp.stdout or "ffmpeg concat failed")[-400:]
+        return True, "ok"
+    except FileNotFoundError:
+        return False, "未找到 ffmpeg"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if list_path and os.path.exists(list_path):
+            try:
+                os.unlink(list_path)
+            except Exception:
+                pass
+
+
+def _sqr_finalize_segment_video(output_path: str, primary_path: str, primary_start_frame: int, primary_keep_frames: int,
+                                fps: float | int | None, audio_source_path: str | None = None,
+                                audio_start_sec: float | None = None, audio_duration_sec: float | None = None,
+                                donor_path: str | None = None, donor_keep_frames: int = 0) -> tuple[bool, int | None, str]:
+    tmp_parts: list[str] = []
+    tmp_join = None
+    try:
+        ok_main, main_part, main_frames, msg_main = _sqr_extract_video_frame_window(
+            primary_path, primary_start_frame, primary_keep_frames, fps
+        )
+        if not ok_main or not main_part:
+            return False, None, msg_main
+        tmp_parts.append(main_part)
+
+        donor_frames = max(0, int(donor_keep_frames or 0))
+        if donor_frames > 0:
+            ok_donor, donor_part, donor_count, msg_donor = _sqr_extract_video_frame_window(
+                donor_path or "", 0, donor_frames, fps
+            )
+            if not ok_donor or not donor_part:
+                return False, None, msg_donor
+            tmp_parts.append(donor_part)
+
+        tmp_join = f"{output_path}.{uuid.uuid4().hex}.join.mp4"
+        if len(tmp_parts) == 1:
+            os.replace(tmp_parts[0], tmp_join)
+            tmp_parts = []
+        else:
+            ok_join, msg_join = _sqr_concat_video_clips(tmp_parts, tmp_join)
+            if not ok_join:
+                return False, None, msg_join
+
+        if audio_source_path and audio_start_sec is not None and audio_duration_sec is not None:
+            ok_audio, msg_audio = _sqr_replace_video_audio(
+                tmp_join,
+                audio_source_path,
+                audio_start_sec,
+                duration_sec=audio_duration_sec,
+                output_path=output_path,
+            )
+            if not ok_audio:
+                return False, None, msg_audio
+        else:
+            os.replace(tmp_join, output_path)
+            tmp_join = None
+
+        out_frames = _sqr_get_video_frame_count(output_path)
+        return True, out_frames, "ok"
+    finally:
+        for _p in tmp_parts:
+            try:
+                if _p and os.path.exists(_p):
+                    os.unlink(_p)
+            except Exception:
+                pass
+        try:
+            if tmp_join and os.path.exists(tmp_join):
+                os.unlink(tmp_join)
+        except Exception:
+            pass
+
+
 
 def _sqr_frames_to_seconds(frame_count: int | float | None, fps: float | int | None) -> float | None:
     try:
@@ -1756,18 +2162,19 @@ def _sqr_replace_video_audio(video_path: str, audio_source_path: str, audio_star
         trim_expr = f"atrim=start={start_sec:.6f}"
         if dur_sec is not None:
             trim_expr += f":duration={dur_sec:.6f}"
+            trim_expr += f",apad,atrim=duration={dur_sec:.6f}"
+        trim_expr += ",asetpts=PTS-STARTPTS"
 
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
             "-i", src,
-            "-filter_complex", f"[1:a:0]{trim_expr},asetpts=PTS-STARTPTS[aout]",
+            "-filter_complex", f"[1:a:0]{trim_expr}[aout]",
             "-map", "0:v:0",
             "-map", "[aout]",
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-shortest",
             "-movflags", "+faststart",
             tmp_path,
         ]
@@ -1923,8 +2330,8 @@ class SegmentQueueRunner:
                 "sqr_manual_splits": ("STRING", {"default": ""}),
                 "sqr_execution_scope": ("STRING", {"default": "start_to_end"}),
                 "sqr_resume_kind": ("STRING", {"default": ""}),
-                "sqr_real_total_frames": ("INT", {"default": -1}),
-                "sqr_real_fps":      ("FLOAT", {"default": -1.0}),
+                "sqr_real_total_frames": ("STRING", {"default": "-1"}),
+                "sqr_real_fps":      ("STRING", {"default": "-1.0"}),
             },
             "hidden": {
                 "过渡跳过帧数": ("INT", {"default": -1}),
@@ -1946,8 +2353,8 @@ class SegmentQueueRunner:
             sqr_manual_splits="",
             sqr_execution_scope="start_to_end",
             sqr_resume_kind="",
-            sqr_real_total_frames=-1,
-            sqr_real_fps=-1.0,
+            sqr_real_total_frames="-1",
+            sqr_real_fps="-1.0",
             过渡跳过帧数=-1,
             prompt=None, extra_pnginfo=None, unique_id=None):
 
@@ -1962,6 +2369,14 @@ class SegmentQueueRunner:
         resume_video_path  = 续跑视频路径.strip()
         local_pose_video_raw = str(本地姿态视频路径 or "").strip()
         local_face_video_raw = str(本地人脸视频路径 or "").strip()
+        try:
+            sqr_real_total_frames = int(float(str(sqr_real_total_frames if sqr_real_total_frames not in (None, "") else -1).strip()))
+        except Exception:
+            sqr_real_total_frames = -1
+        try:
+            sqr_real_fps = float(str(sqr_real_fps if sqr_real_fps not in (None, "") else -1.0).strip())
+        except Exception:
+            sqr_real_fps = -1.0
         resume_enabled     = bool(启用续跑) and bool(resume_video_path)
         skip_frames_manual = 过渡跳过帧数
         ri_node_id         = 参考图节点ID.strip()
@@ -2007,9 +2422,22 @@ class SegmentQueueRunner:
             if _plan_ref_real_path and os.path.isfile(_plan_ref_real_path):
                 _plan_ref_video_info = _sqr_get_video_cv_info(_plan_ref_real_path)
         _plan_total_frames, _plan_total_source = _sqr_resolve_internal_total_frames(_plan_total_frames, _plan_ref_video_info, _plan_ref_params)
+        _plan_local_pose_probe = {"frames": None, "fps": None, "width": None, "height": None}
+        _plan_local_face_probe = {"frames": None, "fps": None, "width": None, "height": None}
+        if local_pose_video_raw:
+            _plan_local_pose_path, _plan_local_pose_probe = _sqr_probe_local_video_asset(local_pose_video_raw)
+        if local_face_video_raw:
+            _plan_local_face_path, _plan_local_face_probe = _sqr_probe_local_video_asset(local_face_video_raw)
+        _plan_total_frames, _plan_local_align_notes = _sqr_align_total_frames_to_local_assets(
+            _plan_total_frames,
+            _plan_ref_params,
+            _plan_local_pose_probe,
+            _plan_local_face_probe,
+        )
 
         _plan_frames = max(1, _plan_total_frames - _frame_offset) if _frame_offset > 0 else _plan_total_frames
         _segment_adjust_notes = []
+        _segment_adjust_notes.extend(_plan_local_align_notes)
         _preview_seg_list = []
 
         # 根据分段模式计算 seg_list（预览用）
@@ -2124,9 +2552,22 @@ class SegmentQueueRunner:
                 elif _runtime_total_source == "fallback_guess":
                     _sqr_log(unique_id, f"[SQR] ℹ 无法直接读取视频真实帧数，已按 Load Video 参数回推内部可用帧数：输入总帧数={_runtime_total_frames} → 估算可用帧数={_runtime_resolved_total}（select_every_nth 始终按1处理）")
             _runtime_total_frames = _runtime_resolved_total
+        _runtime_local_pose_probe = {"frames": None, "fps": None, "width": None, "height": None}
+        _runtime_local_face_probe = {"frames": None, "fps": None, "width": None, "height": None}
+        if local_pose_video_raw:
+            _runtime_local_pose_path, _runtime_local_pose_probe = _sqr_probe_local_video_asset(local_pose_video_raw)
+        if local_face_video_raw:
+            _runtime_local_face_path, _runtime_local_face_probe = _sqr_probe_local_video_asset(local_face_video_raw)
+        _runtime_total_frames, _runtime_local_align_notes = _sqr_align_total_frames_to_local_assets(
+            _runtime_total_frames,
+            _runtime_ref_params,
+            _runtime_local_pose_probe,
+            _runtime_local_face_probe,
+        )
         _effective_frames = max(1, _runtime_total_frames - _frame_offset) if _frame_offset > 0 else _runtime_total_frames
 
         _runtime_seg_notes = []
+        _runtime_seg_notes.extend(_runtime_local_align_notes)
         if _segment_mode == "fixed":
             seg_list = calc_segments_by_fixed(_effective_frames, segments, min_seg_frames=_min_seg_frames)
             _fixed_per_seg_display = max(int(_min_seg_frames), ((int(segments) - 1) // 4) * 4 + 1)
@@ -2158,6 +2599,7 @@ class SegmentQueueRunner:
         segs_to_run = [seg_list[start_idx]] if _segment_only_mode else seg_list[start_idx:]
 
         ae_nid = ae_node_id or find_animate_embeds_node(base_prompt) or ""
+        ae_profile = _sqr_get_wananimateplus_embeds_profile(base_prompt, ae_nid) if ae_nid else None
         vc_nid = find_video_combine_node(base_prompt, combine_nid) or ""
 
         ref_images_list = [x.strip() for x in ref_imgs_str.split(",") if x.strip()]                           if ref_imgs_str else []
@@ -2246,11 +2688,14 @@ class SegmentQueueRunner:
             if local_face_video_raw and not face_node_id:
                 _errs.append("已选择本地人脸视频，但未填写脸部模型节点ID。")
             if (local_pose_video_raw or local_face_video_raw) and not ae_nid:
-                _errs.append(f"已选择本地姿态/人脸视频，但未填写 {WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS} 节点ID。")
+                _errs.append(f"已选择本地姿态/人脸视频，但未填写 {WANANIMATEPLUS_SUPPORTED_EMBEDS_LABEL} 节点ID。")
             if ae_nid and ae_nid not in base_prompt:
-                _errs.append(f"{WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS} 节点ID无效: {ae_nid}")
-            elif ae_nid and base_prompt.get(ae_nid, {}).get("class_type") != WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS:
-                _errs.append(f"节点[{ae_nid}]不是 {WANANIMATEPLUS_ANIMATE_EMBEDS_CLASS}。")
+                _errs.append(f"{WANANIMATEPLUS_SUPPORTED_EMBEDS_LABEL} 节点ID无效: {ae_nid}")
+            elif ae_nid and not ae_profile:
+                _actual_ae_type = base_prompt.get(ae_nid, {}).get("class_type")
+                _errs.append(f"节点[{ae_nid}]不是 {WANANIMATEPLUS_SUPPORTED_EMBEDS_LABEL}（当前: {_actual_ae_type}）。")
+            elif ae_profile and local_face_video_raw and not ae_profile.get("face_input"):
+                _errs.append(f"{ae_profile.get('label')} 不支持 face_images，本地人脸视频接管仅适用于 WanAnimatePlus AnimateEmbeds。")
             if local_pose_video_raw:
                 if pose_node_id and pose_node_id not in base_prompt:
                     _errs.append(f"姿态模型节点ID无效: {pose_node_id}")
@@ -2273,11 +2718,15 @@ class SegmentQueueRunner:
                 if local_pose_video_path:
                     _pose_avail = _sqr_calc_effective_available_frames(local_pose_video_info, _main_ref_params_for_local)
                     if _pose_avail is not None and _pose_avail < _needs_end:
-                        _errs.append(f"本地姿态视频可用帧数不足：按主参考时序策略最多可覆盖 {_pose_avail} 帧，但本次分段最远将访问到第 {_needs_end} 帧。")
+                        _pose_diff = int(_needs_end) - int(_pose_avail)
+                        if _pose_diff > LOCAL_VIDEO_FRAME_TOLERANCE_FRAMES:
+                            log(f"⚠ 本地姿态视频比当前访问上界少 {_pose_diff} 帧（可用 {_pose_avail}，计划访问到 {_needs_end}），已按前面的总帧数对齐策略继续执行。")
                 if local_face_video_path:
                     _face_avail = _sqr_calc_effective_available_frames(local_face_video_info, _main_ref_params_for_local)
                     if _face_avail is not None and _face_avail < _needs_end:
-                        _errs.append(f"本地人脸视频可用帧数不足：按主参考时序策略最多可覆盖 {_face_avail} 帧，但本次分段最远将访问到第 {_needs_end} 帧。")
+                        _face_diff = int(_needs_end) - int(_face_avail)
+                        if _face_diff > LOCAL_VIDEO_FRAME_TOLERANCE_FRAMES:
+                            log(f"⚠ 本地人脸视频比当前访问上界少 {_face_diff} 帧（可用 {_face_avail}，计划访问到 {_needs_end}），已按前面的总帧数对齐策略继续执行。")
             if _errs:
                 _msg = "\n".join(f"[SQR] ✗ {x}" for x in _errs)
                 _sqr_log(unique_id, _msg)
@@ -2377,12 +2826,14 @@ class SegmentQueueRunner:
             segment_output_paths = []
             sqr_cut_cleanup = []
             sqr_cut_paths   = []
+            _carry_shortfall_frames = 0
             _t0 = time.time()
             _total_frames_ran = sum(limit for _, limit in segs_to_run)
             _all_done = False
 
             log(f"{'═'*20} 运行时间码={run_stamp} {'═'*20}")
-            log(f"AnimateEmbeds节点: [{ae_nid}]")
+            _ae_label = ae_profile.get("label") if ae_profile else "未找到"
+            log(f"Embeds节点: [{ae_nid}] {_ae_label}")
             log(f"输出节点: [{vc_nid}]")
             if ref_images_list:
                 log(f"参考图列表: {ref_images_list}")
@@ -2409,7 +2860,7 @@ class SegmentQueueRunner:
                 _pose_tail = f" ({_pose_frames}帧)" if _pose_frames else ""
                 log(f"✓ 本地姿态视频: {_pose_desc}{_pose_tail} → 接管姿态输入，旁路节点[{pose_node_id}]")
                 log("  ✓ 姿态读取策略: 跟随主参考Load Video的帧率、宽高、帧数读取上限、跳过前X帧、间隔、格式与每段skip/limit")
-            if local_face_video_path:
+            if local_face_video_path and (ae_profile or {}).get("face_input"):
                 _face_desc = os.path.basename(local_face_video_path)
                 _face_frames = local_face_video_info.get("frames")
                 _face_tail = f" ({_face_frames}帧)" if _face_frames else ""
@@ -2424,20 +2875,35 @@ class SegmentQueueRunner:
                 wf             = copy.deepcopy(base_prompt)
                 audio_skip_frames = skip
 
-                _actual_skip = skip + _frame_offset
+                _carry_in_shortfall = max(0, int(_carry_shortfall_frames or 0))
+                _actual_skip = max(0, skip + _frame_offset - _carry_in_shortfall)
                 _source_skip = main_ref_skip_first + _actual_skip
+                is_last_seg = (seg_num == total_segs)
+                _planned_keep_frames = max(1, int(limit or 0))
+                _desired_keep_frames = _planned_keep_frames + (_carry_in_shortfall if is_last_seg else 0)
+                _segment_read_cap = _sqr_internal_segment_read_cap(limit, is_last_seg=is_last_seg)
+                _segment_model_frames = _segment_read_cap
+                if is_last_seg:
+                    _segment_model_frames = _sqr_min_input_frames_for_desired_output(
+                        _desired_keep_frames,
+                        use_transition,
+                        base_input_frames=max(_desired_keep_frames, _segment_read_cap),
+                    )
+                    _segment_read_cap = max(_segment_read_cap, _desired_keep_frames, _segment_model_frames)
+                _remaining_source_frames = max(0, int(total_frames or 0) - int(_actual_skip))
+                _estimated_loaded_frames = min(_segment_read_cap, _remaining_source_frames) if _remaining_source_frames > 0 else _segment_read_cap
+                _input_tail_pad_frames = max(0, int(_segment_model_frames) - int(_estimated_loaded_frames))
                 if _frame_offset > 0:
                     log(f"--- 第{seg_num}/{total_segs}段  实际skip={_actual_skip}（段内{skip}+偏移{_frame_offset}）source_skip={_source_skip} limit={limit} ---")
                 else:
                     log(f"--- 第{seg_num}/{total_segs}段  skip={_actual_skip} source_skip={_source_skip} limit={limit} ---")
 
                 wf[node_id]["inputs"]["skip_first_frames"] = _source_skip
-                wf[node_id]["inputs"]["frame_load_cap"]    = limit
+                wf[node_id]["inputs"]["frame_load_cap"]    = _segment_read_cap
                 wf[node_id]["inputs"]["select_every_nth"]  = 1
 
-                _real_skip = skip + _frame_offset
-                is_last_seg = (seg_num == total_segs)
-                trim_plan = _sqr_build_trim_plan(seg_num, total_segs, use_transition, limit, _real_skip, _trim_merge_mode, has_prev=use_transition, has_next=(seg_num < total_segs))
+                _real_skip = _actual_skip
+                trim_plan = _sqr_build_trim_plan(seg_num, total_segs, use_transition, _segment_model_frames, _real_skip, _trim_merge_mode, has_prev=use_transition, has_next=(seg_num < total_segs))
                 audio_skip_frames = main_ref_skip_first + trim_plan["cut_audio_frames"]
 
                 if vc_nid and vc_nid in wf and audio_filename:
@@ -2482,6 +2948,12 @@ class SegmentQueueRunner:
                     log(f"  ⚠ 音频: 无法获取文件名，直接用LoadVideo音频(skip={skip}帧)")
 
                 if ae_nid and ae_nid in wf:
+                    ae_inputs = wf[ae_nid].setdefault("inputs", {})
+                    ae_transition_input = (ae_profile or {}).get("transition_input") or "transition_video"
+                    ae_pose_input = (ae_profile or {}).get("pose_input") or "pose_images"
+                    ae_face_input = (ae_profile or {}).get("face_input")
+                    if "num_frames" in ae_inputs:
+                        ae_inputs["num_frames"] = int(_segment_model_frames)
                     if use_transition:
                         t_skip = skip_frames_manual if skip_frames_manual >= 0 \
                                  else (max(0, last_video_frames - TRANSITION_FRAMES) if last_video_frames else 0)
@@ -2501,10 +2973,10 @@ class SegmentQueueRunner:
                         if height_src:
                             tv_inputs["custom_height"] = height_src
                         wf[tv_tmp_id] = {"class_type": "VHS_LoadVideo", "inputs": tv_inputs}
-                        wf[ae_nid]["inputs"]["transition_video"] = [tv_tmp_id, 0]
-                        log(f"  ✓ 过渡视频: {os.path.basename(last_video_path)} skip={t_skip} limit={TRANSITION_FRAMES}")
+                        ae_inputs[ae_transition_input] = [tv_tmp_id, 0]
+                        log(f"  ✓ 过渡视频: {os.path.basename(last_video_path)} skip={t_skip} limit={TRANSITION_FRAMES} → {ae_transition_input}")
                     else:
-                        wf[ae_nid]["inputs"].pop("transition_video", None)
+                        ae_inputs.pop(ae_transition_input, None)
                         log(f"  首段无过渡")
 
                     _main_lv_node = wf.get(node_id, {})
@@ -2518,13 +2990,13 @@ class SegmentQueueRunner:
                                 _main_lv_inputs_seg,
                                 os.path.basename(local_pose_video_path),
                                 _source_skip,
-                                limit,
+                                _segment_read_cap,
                                 sync_width_height=True,
                             )
                         }
-                        wf[ae_nid]["inputs"]["pose_images"] = [pose_lv_id, 0]
-                        log(f"  ✓ 本地姿态输入: {os.path.basename(local_pose_video_path)} skip={_actual_skip} limit={limit} → pose_images（帧率/宽高/间隔/格式均跟随主参考），旁路节点[{pose_node_id}]")
-                    if local_face_video_path:
+                        ae_inputs[ae_pose_input] = [pose_lv_id, 0]
+                        log(f"  ✓ 本地姿态输入: {os.path.basename(local_pose_video_path)} skip={_actual_skip} limit={limit} → {ae_pose_input}（帧率/宽高/间隔/格式均跟随主参考），旁路节点[{pose_node_id}]")
+                    if local_face_video_path and ae_face_input:
                         face_lv_id = f"sqr_face_lv_{seg_num}"
                         wf[face_lv_id] = {
                             "class_type": _loadvideo_class,
@@ -2532,12 +3004,72 @@ class SegmentQueueRunner:
                                 _main_lv_inputs_seg,
                                 os.path.basename(local_face_video_path),
                                 _source_skip,
-                                limit,
+                                _segment_read_cap,
                                 sync_width_height=False,
                             )
                         }
-                        wf[ae_nid]["inputs"]["face_images"] = [face_lv_id, 0]
-                        log(f"  ✓ 本地人脸输入: {os.path.basename(local_face_video_path)} skip={_actual_skip} limit={limit} → face_images（时序参数跟随主参考，宽高保持原视频），旁路节点[{face_node_id}]")
+                        ae_inputs[ae_face_input] = [face_lv_id, 0]
+                        log(f"  ✓ 本地人脸输入: {os.path.basename(local_face_video_path)} skip={_actual_skip} limit={limit} → {ae_face_input}（时序参数跟随主参考，宽高保持原视频），旁路节点[{face_node_id}]")
+
+                    if _input_tail_pad_frames > 0 and int(_estimated_loaded_frames or 0) > 0:
+                        _main_last_id = f"sqr_main_tail_last_{seg_num}"
+                        _main_rep_id = f"sqr_main_tail_rep_{seg_num}"
+                        _main_join_id = f"sqr_main_tail_join_{seg_num}"
+                        wf[_main_last_id] = {
+                            "class_type": "ImageFromBatch",
+                            "inputs": {"image": [node_id, 0], "batch_index": max(0, int(_estimated_loaded_frames) - 1), "length": 1},
+                        }
+                        wf[_main_rep_id] = {
+                            "class_type": "RepeatImageBatch",
+                            "inputs": {"image": [_main_last_id, 0], "amount": int(_input_tail_pad_frames)},
+                        }
+                        wf[_main_join_id] = {
+                            "class_type": "ImageBatchMulti",
+                            "inputs": {"inputcount": 2, "image_1": [node_id, 0], "image_2": [_main_rep_id, 0]},
+                        }
+                        _sqr_rewire_prompt_output(
+                            wf,
+                            node_id,
+                            0,
+                            [_main_join_id, 0],
+                            skip_node_ids={_main_last_id, _main_rep_id, _main_join_id},
+                        )
+
+                        if local_pose_video_path:
+                            _pose_last_id = f"sqr_pose_tail_last_{seg_num}"
+                            _pose_rep_id = f"sqr_pose_tail_rep_{seg_num}"
+                            _pose_join_id = f"sqr_pose_tail_join_{seg_num}"
+                            wf[_pose_last_id] = {
+                                "class_type": "ImageFromBatch",
+                                "inputs": {"image": [pose_lv_id, 0], "batch_index": max(0, int(_estimated_loaded_frames) - 1), "length": 1},
+                            }
+                            wf[_pose_rep_id] = {
+                                "class_type": "RepeatImageBatch",
+                                "inputs": {"image": [_pose_last_id, 0], "amount": int(_input_tail_pad_frames)},
+                            }
+                            wf[_pose_join_id] = {
+                                "class_type": "ImageBatchMulti",
+                                "inputs": {"inputcount": 2, "image_1": [pose_lv_id, 0], "image_2": [_pose_rep_id, 0]},
+                            }
+                            ae_inputs[ae_pose_input] = [_pose_join_id, 0]
+
+                        if local_face_video_path and ae_face_input:
+                            _face_last_id = f"sqr_face_tail_last_{seg_num}"
+                            _face_rep_id = f"sqr_face_tail_rep_{seg_num}"
+                            _face_join_id = f"sqr_face_tail_join_{seg_num}"
+                            wf[_face_last_id] = {
+                                "class_type": "ImageFromBatch",
+                                "inputs": {"image": [face_lv_id, 0], "batch_index": max(0, int(_estimated_loaded_frames) - 1), "length": 1},
+                            }
+                            wf[_face_rep_id] = {
+                                "class_type": "RepeatImageBatch",
+                                "inputs": {"image": [_face_last_id, 0], "amount": int(_input_tail_pad_frames)},
+                            }
+                            wf[_face_join_id] = {
+                                "class_type": "ImageBatchMulti",
+                                "inputs": {"inputcount": 2, "image_1": [face_lv_id, 0], "image_2": [_face_rep_id, 0]},
+                            }
+                            ae_inputs[ae_face_input] = [_face_join_id, 0]
 
                 if ref_images_list and ri_node_id and ri_node_id in wf:
                     img_idx   = min(i, len(ref_images_list) - 1)
@@ -2556,14 +3088,15 @@ class SegmentQueueRunner:
 
                 image_src = image_src_node
                 trim_start = trim_plan["trim_start"]
-                trim_len   = trim_plan["trim_len"]
+                trim_len   = max(1, int(trim_plan["trim_len"] or _desired_keep_frames))
                 ifb_a = f"sqr_ifb_{seg_num}_a"
                 wf[ifb_a] = {"class_type": "ImageFromBatch",
                              "inputs": {"image": image_src, "batch_index": trim_start, "length": trim_len}}
                 final_image_node = ifb_a
-                log(f"  输出帧数: {trim_len}帧")
+                log(f"  输出帧数: {_desired_keep_frames}帧")
 
                 cut_vc_id = None
+                _cut_audio_slice = None
                 if vc_nid and vc_nid in wf:
                     wf[vc_nid]["inputs"]["images"] = image_src
 
@@ -2572,6 +3105,7 @@ class SegmentQueueRunner:
                     cut_inputs["images"]          = [final_image_node, 0]
                     cut_inputs["save_output"]     = True
                     cut_inputs["save_metadata"]   = False
+                    cut_inputs.pop("audio", None)
                     _main_prefix = wf[vc_nid]["inputs"].get("filename_prefix", "")
                     _slash = max(_main_prefix.rfind("/"), _main_prefix.rfind("\\"))
                     _subfolder_prefix = _main_prefix[:_slash+1] if _slash >= 0 else ""
@@ -2584,28 +3118,17 @@ class SegmentQueueRunner:
                         _audio_source_total_frames = max(0, int(main_ref_skip_first + total_frames))
                         _cut_audio_slice = _sqr_prepare_audio_slice(
                             audio_skip_frames,
-                            trim_len,
+                            _desired_keep_frames,
                             audio_timeline_fps,
                             _audio_source_total_frames,
                         )
                         if _cut_audio_slice:
-                            cut_audio_id = f"sqr_cut_audio_{seg_num}"
-                            wf[cut_audio_id] = {
-                                "class_type": "VHS_LoadAudioUpload",
-                                "inputs": {
-                                    "audio":      audio_filename,
-                                    "start_time": _cut_audio_slice["start_sec"],
-                                    "duration":   _cut_audio_slice["duration_sec"],
-                                }
-                            }
-                            cut_inputs["audio"] = [cut_audio_id, 0]
-                            log(f"  ✓ cut_vc音频: start={_cut_audio_slice['start_sec']:.3f}s duration={_cut_audio_slice['duration_sec']:.3f}s (start={_cut_audio_slice['start_frames']}帧 len={_cut_audio_slice['duration_frames']}帧)")
+                            log(f"  ✓ 分段音频时间轴: start={_cut_audio_slice['start_sec']:.3f}s duration={_cut_audio_slice['duration_sec']:.3f}s (start={_cut_audio_slice['start_frames']}帧 len={_cut_audio_slice['duration_frames']}帧)")
                             if assembled_audio_start_frame is None and not pre_segment_paths:
                                 assembled_audio_start_frame = max(0, int(_cut_audio_slice["start_frames"]))
                                 assembled_audio_start_sec = _sqr_frames_to_seconds(assembled_audio_start_frame, audio_timeline_fps) or 0.0
                         else:
-                            cut_inputs.pop("audio", None)
-                            log(f"  ⚠ cut_vc音频切片无有效长度，已跳过挂载 (start={audio_skip_frames}帧 len={trim_len}帧)")
+                            log(f"  ⚠ 分段音频切片无有效长度，后处理将跳过回贴 (start={audio_skip_frames}帧 len={_desired_keep_frames}帧)")
 
                     wf[cut_vc_id] = {"class_type": "VHS_VideoCombine", "inputs": cut_inputs}
                     _cut_search_dir = os.path.join(folder_paths.get_output_directory(),
@@ -2785,49 +3308,99 @@ class SegmentQueueRunner:
                         save_speed_record(_elapsed, _frames_done)
 
                         cut_vc_id_done = f"sqr_cut_vc_{seg_num}"
+                        _transition_source_path = None
+                        _transition_source_frames = None
                         if vc_nid:
                             cut_vpath, _ = get_output_video_info(pid, cut_vc_id_done)
                             if not cut_vpath:
                                 cut_vpath, _ = get_output_video_info(pid, vc_nid)
                             _segment_validation_failed = False
                             if cut_vpath:
+                                _raw_cut_frames = _sqr_get_video_frame_count(cut_vpath)
+                                _expected_cut_frames = _desired_keep_frames
+                                _final_cut_frames_target = _expected_cut_frames
+                                _shortfall_frames = 0
+                                if _raw_cut_frames is None:
+                                    _actual_cut_frames = None
+                                else:
+                                    _actual_cut_frames = int(_raw_cut_frames)
+                                    if _actual_cut_frames < _expected_cut_frames and not is_last_seg:
+                                        _shortfall_frames = int(_expected_cut_frames) - int(_actual_cut_frames)
+                                        _carry_shortfall_frames += _shortfall_frames
+                                        _final_cut_frames_target = int(_actual_cut_frames)
+                                    else:
+                                        _final_cut_frames_target = int(_expected_cut_frames)
+                                    _fix_ok, _fixed_frames, _fix_msg = _sqr_rewrite_video_to_exact_frames(
+                                        cut_vpath,
+                                        _final_cut_frames_target,
+                                        audio_timeline_fps,
+                                        force_reencode=True,
+                                    )
+                                    if _fixed_frames is not None:
+                                        _actual_cut_frames = int(_fixed_frames)
+                                    if (not _fix_ok) and _fix_msg and _fix_msg != "无需修正":
+                                        log(f"  ⚠ 输出修正失败：{_fix_msg}")
+
+                                _segment_audio_source = assembled_audio_source_path or audio_source_path
+                                _audio_source_total_frames = max(0, int(main_ref_skip_first + total_frames))
+                                _final_cut_audio_slice = _sqr_prepare_audio_slice(
+                                    audio_skip_frames,
+                                    _actual_cut_frames,
+                                    audio_timeline_fps,
+                                    _audio_source_total_frames,
+                                ) if _actual_cut_frames else None
+                                if _final_cut_audio_slice and _segment_audio_source:
+                                    _audio_ok, _audio_msg = _sqr_replace_video_audio(
+                                        cut_vpath,
+                                        _segment_audio_source,
+                                        _final_cut_audio_slice["start_sec"],
+                                        duration_sec=_final_cut_audio_slice["duration_sec"],
+                                    )
+                                    if not _audio_ok:
+                                        log(f"  ⚠ 分段音频回贴失败：{_audio_msg}")
+                                elif audio_filename:
+                                    log("  ⚠ 分段音频回贴已跳过：缺少有效音频切片或音频源")
                                 segment_output_paths.append(cut_vpath)
                                 sqr_cut_paths.append(cut_vpath)
-                                _actual_cut_frames = _sqr_get_video_frame_count(cut_vpath)
-                                _expected_cut_frames = trim_plan.get("trim_len")
                                 if _actual_cut_frames is None:
                                     log(f"  ⚠ 输出校验: 无法读取帧数（预期{_expected_cut_frames}帧）")
                                 else:
                                     _diff = abs(int(_actual_cut_frames) - int(_expected_cut_frames))
-                                    # 输出帧数误差分级：
-                                    # ≤2: ✓/⚠ 可接受（h264 编码器偶发 GOP 边界问题）
-                                    # ≤半段过渡帧: ⚠ 警告但继续（对应 split-trim 量级，
-                                    #      一般是 VHS_VideoCombine 在某些 codec/分辨率下的帧率重采样误差）
-                                    # >半段过渡帧: ✗ 致命，停止执行
-                                    _warn_tolerance = max(TRANSITION_TRIM_HEAD, TRANSITION_TRIM_TAIL)
-                                    if _diff <= 2:
-                                        _level = "✓" if _diff == 0 else "⚠"
-                                        log(f"  {_level} 输出校验: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}")
-                                    elif _diff <= _warn_tolerance:
-                                        log(f"  ✓ 输出校验: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}（在编码器容忍范围内，继续执行）")
+                                    if _shortfall_frames > 0:
+                                        log(f"  ⚠ 输出校验: 计划{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，顺延{_shortfall_frames}帧到后续分段吸收（不补静帧）")
                                     else:
-                                        log(f"  ✗ 输出校验失败: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}，停止执行")
-                                        _segment_validation_failed = True
-                                _cut_duration_expected = _sqr_frames_to_seconds(_expected_cut_frames, audio_timeline_fps) if _expected_cut_frames else None
+                                        # 输出帧数误差分级：
+                                        # ≤2: ✓/⚠ 可接受（h264 编码器偶发 GOP 边界问题）
+                                        # ≤半段过渡帧: ⚠ 警告但继续（对应 split-trim 量级，
+                                        #      一般是 VHS_VideoCombine 在某些 codec/分辨率下的帧率重采样误差）
+                                        # >半段过渡帧: ✗ 致命，停止执行
+                                        _warn_tolerance = max(TRANSITION_TRIM_HEAD, TRANSITION_TRIM_TAIL)
+                                        if _diff <= 2:
+                                            _level = "✓" if _diff == 0 else "⚠"
+                                            log(f"  {_level} 输出校验: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}")
+                                        elif _diff <= _warn_tolerance:
+                                            log(f"  ✓ 输出校验: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}（在编码器容忍范围内，继续执行）")
+                                        else:
+                                            log(f"  ✗ 输出校验失败: 预期{_expected_cut_frames}帧，实际{_actual_cut_frames}帧，误差{_diff}，停止执行")
+                                            _segment_validation_failed = True
+                                _cut_duration_expected = _sqr_frames_to_seconds(_actual_cut_frames, audio_timeline_fps) if _actual_cut_frames else None
                                 _cut_duration_probe = _sqr_ffprobe_duration_seconds(cut_vpath)
                                 _cut_duration = _cut_duration_expected or _cut_duration_probe
-                                if _expected_cut_frames:
-                                    assembled_audio_total_frames += max(0, int(_expected_cut_frames))
+                                if _actual_cut_frames:
+                                    assembled_audio_total_frames += max(0, int(_actual_cut_frames))
+                                if assembled_audio_start_frame is None and _final_cut_audio_slice and not pre_segment_paths:
+                                    assembled_audio_start_frame = max(0, int(_final_cut_audio_slice["start_frames"]))
+                                    assembled_audio_start_sec = _sqr_frames_to_seconds(assembled_audio_start_frame, audio_timeline_fps) or 0.0
                                 _sqr_write_media_meta(cut_vpath, {
                                     "media_role": "segment_cut",
                                     "run_mode": _run_mode,
                                     "resume_kind": _resume_kind,
                                     "audio_mode": "continuous_original_segment",
                                     "audio_source_path": assembled_audio_source_path or audio_source_path or "",
-                                    "audio_start_sec": _sqr_frames_to_seconds(audio_skip_frames, audio_timeline_fps),
-                                    "audio_start_frame": int(audio_skip_frames),
-                                    "audio_frame_count": int(_expected_cut_frames or 0),
-                                    "kept_frame_count": int(_expected_cut_frames or 0),
+                                    "audio_start_sec": _final_cut_audio_slice["start_sec"] if _final_cut_audio_slice else _sqr_frames_to_seconds(audio_skip_frames, audio_timeline_fps),
+                                    "audio_start_frame": int(_final_cut_audio_slice["start_frames"]) if _final_cut_audio_slice else int(audio_skip_frames),
+                                    "audio_frame_count": int(_actual_cut_frames or 0),
+                                    "kept_frame_count": int(_actual_cut_frames or 0),
                                     "duration_sec": _cut_duration,
                                     "duration_sec_expected": _cut_duration_expected,
                                     "duration_sec_probe": _cut_duration_probe,
@@ -2837,6 +3410,8 @@ class SegmentQueueRunner:
                                     "continuous_time_axis": True,
                                 })
                                 log(f"  ✓ 输出文件: {os.path.basename(cut_vpath)}")
+                                _transition_source_path = cut_vpath
+                                _transition_source_frames = _actual_cut_frames
                             else:
                                 log(f"  ⚠ 未找到输出视频")
                                 _segment_validation_failed = True
@@ -2845,20 +3420,22 @@ class SegmentQueueRunner:
                                 break
 
                         vpath, vframes = get_output_video_info(pid, vc_nid) if vc_nid else (None, None)
-                        if not vpath:
+                        if not (_transition_source_path or vpath):
                             log(f"  ⚠ 完整视频获取失败，下段过渡将跳过")
-                        if vpath:
+                        _transition_copy_src = _transition_source_path or vpath
+                        _transition_copy_frames = _transition_source_frames if _transition_source_frames is not None else vframes
+                        if _transition_copy_src:
                             input_fname = f"sqr_trans_{run_stamp}_seg{seg_num}.mp4"
                             try:
                                 input_path = _sqr_copy_into_input(
-                                    vpath,
+                                    _transition_copy_src,
                                     desired_name=input_fname,
                                     unique_id=unique_id,
                                     prefix="sqr_trans",
                                 )
                                 last_video_path   = input_path
-                                last_video_frames = vframes
-                                log(f"  ✓ 已复制到 input/: {os.path.basename(input_path)} ({vframes}帧，过渡缓存)")
+                                last_video_frames = _transition_copy_frames
+                                log(f"  ✓ 已复制到 input/: {os.path.basename(input_path)} ({_transition_copy_frames}帧，过渡缓存)")
                             except Exception as e:
                                 log(f"  ✗ 复制失败: {e}")
                                 last_video_path = last_video_frames = None
@@ -2951,6 +3528,7 @@ class SegmentQueueRunner:
                 _sqr_progress_set(unique_id, **_sqr_progress_payload(unique_id, status="done", run_mode=_run_mode, current_segment=1, total_segments=len(seg_list), completed_segments=1, current_stage="single_done", execution_scope=_execution_scope, last_message="单段输出完成"))
                 log(f"只有1段，无需合并")
 
+            _preserve_cut_realpaths = {os.path.realpath(str(_p)) for _p in sqr_cut_paths if _p}
             for (_clean_dir, _clean_prefix) in sqr_cut_cleanup:
                 try:
                     if not os.path.isdir(_clean_dir):
@@ -2959,6 +3537,11 @@ class SegmentQueueRunner:
                         if not _f.startswith(_clean_prefix):
                             continue
                         _fpath = os.path.join(_clean_dir, _f)
+                        try:
+                            if os.path.realpath(_fpath) in _preserve_cut_realpaths:
+                                continue
+                        except Exception:
+                            pass
                         if _f.endswith(".mp4") and "-audio" in _f:
                             continue
                         if _f.endswith(".mp4") or _f.endswith(".png"):
@@ -3030,7 +3613,7 @@ class SegmentQueueRunner:
 
 
 NODE_CLASS_MAPPINGS        = {"SegmentQueueRunner": SegmentQueueRunner}
-NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "🎬分段队列@肥猴🐵@wuwu🚂@雪子❄️"}
+NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "🎬分段队列 v3.6@肥猴🐵@wuwu🚂@雪子❄️"}
 
 
 # ── 后端 API ─────────────────────────────────────────────────────
@@ -3045,6 +3628,11 @@ async def sqr_get_logs(request):
 async def sqr_get_progress(request):
     uid = request.rel_url.query.get("uid", "")
     return web.json_response({"progress": _sqr_progress_get(uid)})
+
+@server.PromptServer.instance.routes.post("/sqr/progress/clear")
+async def sqr_clear_progress(request):
+    _sqr_progress_clear(request.rel_url.query.get("uid", ""))
+    return web.json_response({"ok": True})
 
 @server.PromptServer.instance.routes.post("/sqr/logs/clear")
 async def sqr_clear_logs(request):

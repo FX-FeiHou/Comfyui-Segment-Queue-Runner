@@ -6,16 +6,15 @@ A powerful ComfyUI custom node tailored for high-performance AI video generation
 
 ---
 
-### 🚨 What's New in V3.0 (Changelog)
-* **Perfect Alignment**: Fully compatible with the [ComfyUI-WanAnimatePlus](https://github.com/wuwukaka/ComfyUI-WanAnimatePlus) framework; discontinued support for the legacy WanVideoWrapper framework.
-* **3 Advanced Segmentation Modes**:
-  1. **Average**: Automatically divides your total frame count into equal segments.
-  2. **Manual**: Features a custom visual timeline interface (video track layout) with a live **Video Preview** for frame-perfect beat-matching.
-  3. **Fixed Frames**: Splits the video into segments based on a precise, user-defined fixed frame count.
-* **Smart Video Stitching (No Quality Loss)**: Fixed the re-encoding bug. Segments are now **merged directly and instantly** if their FPS and time bases match perfectly, skipping unnecessary rendering time.
-* **Local Video References**: Supports passing pre-computed local skeleton/pose and facial reference videos directly via Node ID mapping. This eliminates redundant asset capturing when reusing identical choreography or dance loops.
-* **Robust Queue Controls**: Fully adapts auto-resume and continuous queue mechanics across all 3 segmentation modes.
-* 🐱 **Hidden Easter Egg**: Added a little fun surprise for you to discover!
+### 🚨 What's New in V3.6 (Changelog)
+* Compatible with old workflows, no errors even if parameters are blank.
+* Auto-detect total frames and FPS, no manual input required.
+* Auto fill default values when loading or saving workflows to avoid runtime issues.
+* Node controls will not misalign after switching ComfyUI tabs.
+* Interruption reminders are displayed next to resume button for neat layout.
+* Reminders disappear after turning off resume, users can start new tasks normally.
+* Clear breakpoints cache automatically when closing resume to prevent data conflicts.
+* New progress cleanup function to remove leftover error and interruption hints.
 
 ---
 
