@@ -6,7 +6,14 @@ A powerful ComfyUI custom node tailored for high-performance AI video generation
 
 ---
 
-### 🚨 What's New in V3.6 (Changelog)
+### 🚨 What's New in V3.7 (Changelog)
+* Fixed Windows GBK / non-UTF-8 code page compatibility for `ffmpeg` and `ffprobe`.
+* Audio sources with Chinese or non-ASCII paths are now mapped through safe ASCII temporary paths before probing or remuxing.
+* Fixed false “no available audio track” warnings caused by `ffprobe` failing to read localized file paths.
+* Improved diagnostics: real silent/no-audio sources are now separated from path encoding or permission failures.
+* Safer concat list generation for segment merging, reducing path encoding failures during final video assembly.
+
+Previous V3.6 highlights:
 * Compatible with old workflows, no errors even if parameters are blank.
 * Auto-detect total frames and FPS, no manual input required.
 * Auto fill default values when loading or saving workflows to avoid runtime issues.

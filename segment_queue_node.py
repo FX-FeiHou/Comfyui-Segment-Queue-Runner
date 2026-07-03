@@ -9,7 +9,7 @@
 # Distributed on an "AS IS" BASIS; see the LICENSE file for the full terms.
 
 """
-ComfyUI 分段自动队列节点 v3.6 版
+ComfyUI 分段自动队列节点 v3.7 版
 """
 
 import math, copy, json, time, os, threading, urllib.request, urllib.error, hashlib, socket, uuid, tempfile
@@ -924,6 +924,221 @@ def _sqr_get_video_frame_count(video_path: str | None) -> int | None:
     return None
 
 
+def _sqr_is_ascii_path(path) -> bool:
+    try:
+        str(path or "").encode("ascii")
+        return True
+    except Exception:
+        return False
+
+
+def _sqr_short_error(text, limit: int = 500) -> str:
+    msg = str(text or "").strip()
+    return msg[-limit:] if len(msg) > limit else msg
+
+
+def _sqr_media_cmd_error(resp) -> str:
+    if resp is None:
+        return ""
+    return _sqr_short_error(getattr(resp, "stderr", "") or getattr(resp, "stdout", "") or f"returncode={getattr(resp, 'returncode', '')}")
+
+
+def _sqr_run_media_cmd(cmd: list[str]):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def _sqr_windows_short_path(path: str | None) -> str | None:
+    if os.name != "nt" or not path:
+        return None
+    try:
+        import ctypes
+        real = os.path.realpath(str(path))
+        buf_len = ctypes.windll.kernel32.GetShortPathNameW(real, None, 0)
+        if buf_len <= 0:
+            return None
+        buf = ctypes.create_unicode_buffer(buf_len)
+        ret = ctypes.windll.kernel32.GetShortPathNameW(real, buf, buf_len)
+        if ret <= 0:
+            return None
+        short = buf.value
+        if short and os.path.exists(short) and _sqr_is_ascii_path(short):
+            return short
+    except Exception:
+        return None
+    return None
+
+
+def _sqr_external_path_candidates(path: str | None) -> list[str]:
+    raw = str(path or "").strip()
+    if not raw:
+        return []
+    real = os.path.realpath(raw)
+    candidates = []
+    seen = set()
+
+    def add(p):
+        if not p:
+            return
+        key = os.path.normcase(os.path.realpath(str(p)))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(str(p))
+
+    short = _sqr_windows_short_path(real)
+    if short and not _sqr_is_ascii_path(real):
+        add(short)
+    add(real)
+    if short and _sqr_is_ascii_path(real):
+        add(short)
+    return candidates
+
+
+def _sqr_ascii_ext(path: str | None, default_ext: str = ".mp4") -> str:
+    ext = os.path.splitext(str(path or ""))[1]
+    if not ext or len(ext) > 16 or not _sqr_is_ascii_path(ext):
+        return default_ext
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if any(ch not in allowed for ch in ext):
+        return default_ext
+    return ext
+
+
+def _sqr_make_media_workdir(prefix: str = "sqr_ffmpeg_", related_paths: list[str] | None = None) -> str:
+    roots = []
+    seen = set()
+
+    def add_root(root):
+        if not root:
+            return
+        root = os.path.realpath(str(root))
+        key = os.path.normcase(root)
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+
+    if os.name == "nt":
+        for p in related_paths or []:
+            try:
+                drive = os.path.splitdrive(os.path.realpath(str(p)))[0]
+                if drive:
+                    add_root(os.path.join(drive + os.sep, "sqr_ffmpeg_temp"))
+            except Exception:
+                pass
+        public_dir = os.environ.get("PUBLIC")
+        if public_dir:
+            add_root(os.path.join(public_dir, "sqr_ffmpeg_temp"))
+        system_drive = os.environ.get("SystemDrive")
+        if system_drive:
+            add_root(os.path.join(system_drive + os.sep, "sqr_ffmpeg_temp"))
+    add_root(os.environ.get("SQR_FFMPEG_TEMP_DIR"))
+    cwd = os.getcwd()
+    if _sqr_is_ascii_path(cwd):
+        add_root(os.path.join(cwd, "sqr_ffmpeg_temp"))
+    tmp_root = tempfile.gettempdir()
+    if _sqr_is_ascii_path(tmp_root):
+        add_root(os.path.join(tmp_root, "sqr_ffmpeg_temp"))
+    add_root(os.path.join(tmp_root, "sqr_ffmpeg_temp"))
+
+    last_err = None
+    for root in roots:
+        try:
+            os.makedirs(root, exist_ok=True)
+            return tempfile.mkdtemp(prefix=prefix, dir=root)
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return tempfile.mkdtemp(prefix=prefix)
+
+
+def _sqr_cleanup_media_workdir(workdir: str | None):
+    if not workdir:
+        return
+    try:
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _sqr_alias_media_input(src_path: str, workdir: str, stem: str, default_ext: str = ".mp4") -> str:
+    import shutil
+    src_real = os.path.realpath(str(src_path))
+    ext = _sqr_ascii_ext(src_real, default_ext)
+    alias = os.path.join(workdir, f"{stem}{ext}")
+    if os.path.exists(alias):
+        try:
+            os.unlink(alias)
+        except Exception:
+            alias = os.path.join(workdir, f"{stem}_{uuid.uuid4().hex[:8]}{ext}")
+    try:
+        os.link(src_real, alias)
+    except Exception:
+        shutil.copy2(src_real, alias)
+    return alias
+
+
+def _sqr_alias_media_output(workdir: str, stem: str, target_path: str, default_ext: str = ".mp4") -> str:
+    ext = _sqr_ascii_ext(target_path, default_ext)
+    return os.path.join(workdir, f"{stem}{ext}")
+
+
+def _sqr_replace_from_media_tmp(tmp_path: str, target_path: str):
+    import shutil
+    try:
+        os.replace(tmp_path, target_path)
+    except OSError:
+        shutil.copy2(tmp_path, target_path)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _sqr_should_use_media_alias(*paths) -> bool:
+    if os.name != "nt":
+        return False
+    for p in paths:
+        if p and not _sqr_is_ascii_path(os.path.realpath(str(p))):
+            return True
+    return False
+
+
+def _sqr_ffconcat_path(path: str) -> str:
+    return str(path).replace("\\", "/").replace("'", "'\\''")
+
+
+def _sqr_run_media_cmd_with_single_input(input_path: str, cmd_builder, work_prefix: str = "sqr_probe_"):
+    errors = []
+    last_resp = None
+    for tool_path in _sqr_external_path_candidates(input_path):
+        resp = _sqr_run_media_cmd(cmd_builder(tool_path))
+        if resp.returncode == 0:
+            return resp, ""
+        last_resp = resp
+        errors.append(_sqr_media_cmd_error(resp))
+
+    real = os.path.realpath(str(input_path))
+    if os.name == "nt" and not _sqr_is_ascii_path(real):
+        workdir = None
+        try:
+            workdir = _sqr_make_media_workdir(work_prefix, [real])
+            alias = _sqr_alias_media_input(real, workdir, "in0")
+            resp = _sqr_run_media_cmd(cmd_builder(alias))
+            if resp.returncode == 0:
+                return resp, ""
+            last_resp = resp
+            errors.append(_sqr_media_cmd_error(resp))
+        except Exception as e:
+            errors.append(str(e))
+        finally:
+            _sqr_cleanup_media_workdir(workdir)
+
+    return last_resp, _sqr_short_error(" | ".join([e for e in errors if e]))
+
+
 def _sqr_prepare_local_video_asset(raw_path: str | None, unique_id=None, prefix: str = "sqr_local"):
     path = _sqr_resolve_media_path(raw_path)
     if not path or not os.path.isfile(path):
@@ -1649,14 +1864,21 @@ def _sqr_build_trim_plan(seg_num: int, total_segs: int, use_transition: bool, li
 
 
 def _sqr_ffprobe_video_info(video_path: str) -> dict:
-    import subprocess
-    info = {"fps": None, "time_base": None, "width": None, "height": None, "codec": None, "pix_fmt": None, "has_audio": None}
+    info = {
+        "fps": None, "time_base": None, "width": None, "height": None,
+        "codec": None, "pix_fmt": None, "has_audio": None,
+        "probe_ok": False, "probe_error": "",
+    }
     if not video_path or not os.path.isfile(video_path):
+        info["probe_error"] = "文件不存在"
         return info
     try:
-        cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", video_path]
-        resp = subprocess.run(cmd, capture_output=True, text=True)
-        if resp.returncode != 0:
+        def build_cmd(path):
+            return ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path]
+
+        resp, err = _sqr_run_media_cmd_with_single_input(video_path, build_cmd, "sqr_ffprobe_")
+        if resp is None or resp.returncode != 0:
+            info["probe_error"] = err or _sqr_media_cmd_error(resp)
             return info
         data = json.loads(resp.stdout or "{}")
         streams = data.get("streams") or []
@@ -1676,8 +1898,9 @@ def _sqr_ffprobe_video_info(video_path: str) -> dict:
             info["codec"] = vstream.get("codec_name")
             info["pix_fmt"] = vstream.get("pix_fmt")
         info["has_audio"] = any(s.get("codec_type") == "audio" for s in streams)
-    except Exception:
-        pass
+        info["probe_ok"] = True
+    except Exception as e:
+        info["probe_error"] = str(e)
     return info
 
 
@@ -1762,18 +1985,19 @@ def _sqr_read_media_meta(video_path: str) -> dict | None:
     except Exception:
         return None
 def _sqr_ffprobe_duration_seconds(video_path: str) -> float | None:
-    import subprocess
     if not video_path or not os.path.isfile(video_path):
         return None
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            video_path,
-        ]
-        resp = subprocess.run(cmd, capture_output=True, text=True)
-        if resp.returncode != 0:
+        def build_cmd(path):
+            return [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]
+
+        resp, _ = _sqr_run_media_cmd_with_single_input(video_path, build_cmd, "sqr_ffprobe_")
+        if resp is None or resp.returncode != 0:
             return None
         val = float((resp.stdout or "").strip() or 0)
         return val if val > 0 else None
@@ -1782,8 +2006,16 @@ def _sqr_ffprobe_duration_seconds(video_path: str) -> float | None:
 
 
 
+def _sqr_ffprobe_audio_state(video_path: str) -> tuple[bool | None, str]:
+    info = _sqr_ffprobe_video_info(video_path)
+    if not info.get("probe_ok"):
+        return None, str(info.get("probe_error") or "")
+    return bool(info.get("has_audio")), ""
+
+
 def _sqr_ffprobe_has_audio(video_path: str) -> bool:
-    return bool(_sqr_ffprobe_video_info(video_path).get("has_audio"))
+    has_audio, _ = _sqr_ffprobe_audio_state(video_path)
+    return bool(has_audio)
 
 
 def _sqr_rewrite_video_to_exact_frames(video_path: str, target_frames: int, fps: float | int | None,
@@ -1820,23 +2052,31 @@ def _sqr_rewrite_video_to_exact_frames(video_path: str, target_frames: int, fps:
     vf_parts.append("setpts=PTS-STARTPTS")
     vf_expr = ",".join(vf_parts)
 
-    tmp_path = f"{path}.{uuid.uuid4().hex}.fix.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-i", path,
-        "-vf", vf_expr,
-        "-r", fps_str,
-        "-vsync", "cfr",
-        "-video_track_timescale", "90000",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-an",
-    ]
-    cmd.append(tmp_path)
-
+    workdir = None
+    tmp_path = None
     try:
-        resp = subprocess.run(cmd, capture_output=True, text=True)
+        in_path = path
+        if _sqr_should_use_media_alias(path):
+            workdir = _sqr_make_media_workdir("sqr_fix_", [path])
+            in_path = _sqr_alias_media_input(path, workdir, "in0")
+            tmp_path = _sqr_alias_media_output(workdir, "out", path)
+        else:
+            tmp_path = f"{path}.{uuid.uuid4().hex}.fix.mp4"
+
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-vf", vf_expr,
+            "-r", fps_str,
+            "-vsync", "cfr",
+            "-video_track_timescale", "90000",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            tmp_path,
+        ]
+        resp = _sqr_run_media_cmd(cmd)
         if resp.returncode != 0 or not os.path.isfile(tmp_path):
-            if os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except Exception:
@@ -1852,22 +2092,25 @@ def _sqr_rewrite_video_to_exact_frames(video_path: str, target_frames: int, fps:
                 pass
             return False, int(actual), "修正后无法读取视频帧数"
 
-        os.replace(tmp_path, path)
+        _sqr_replace_from_media_tmp(tmp_path, path)
+        tmp_path = None
         return True, int(fixed_frames), "已修正"
     except FileNotFoundError:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
         return False, int(actual), "未找到 ffmpeg"
     except Exception as e:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
         return False, int(actual), str(e)
+    finally:
+        _sqr_cleanup_media_workdir(workdir)
 
 
 def _sqr_extract_video_frame_window(video_path: str, start_frame: int, keep_frames: int,
@@ -1889,28 +2132,40 @@ def _sqr_extract_video_frame_window(video_path: str, start_frame: int, keep_fram
         return False, None, None, "未找到 ffmpeg"
 
     out_path = output_path or f"{path}.{uuid.uuid4().hex}.clip.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-i", path,
-        "-vf", f"trim=start_frame={start}:end_frame={start + keep},setpts=PTS-STARTPTS",
-        "-r", f"{float(fps_val):.9f}".rstrip("0").rstrip("."),
-        "-vsync", "cfr",
-        "-video_track_timescale", "90000",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-an",
-        out_path,
-    ]
+    workdir = None
+    cmd_out_path = out_path
     try:
-        resp = subprocess.run(cmd, capture_output=True, text=True)
-        if resp.returncode != 0 or not os.path.isfile(out_path):
+        in_path = path
+        if _sqr_should_use_media_alias(path, out_path):
+            workdir = _sqr_make_media_workdir("sqr_clip_", [out_path, path])
+            in_path = _sqr_alias_media_input(path, workdir, "in0")
+            cmd_out_path = _sqr_alias_media_output(workdir, "out", out_path)
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-vf", f"trim=start_frame={start}:end_frame={start + keep},setpts=PTS-STARTPTS",
+            "-r", f"{float(fps_val):.9f}".rstrip("0").rstrip("."),
+            "-vsync", "cfr",
+            "-video_track_timescale", "90000",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            cmd_out_path,
+        ]
+        resp = _sqr_run_media_cmd(cmd)
+        if resp.returncode != 0 or not os.path.isfile(cmd_out_path):
             err = (resp.stderr or resp.stdout or "ffmpeg failed")[-400:]
             return False, None, None, err
-        out_frames = _sqr_get_video_frame_count(out_path)
+        out_frames = _sqr_get_video_frame_count(cmd_out_path)
+        if cmd_out_path != out_path:
+            _sqr_replace_from_media_tmp(cmd_out_path, out_path)
+            cmd_out_path = out_path
         return True, out_path, out_frames, "ok"
     except FileNotFoundError:
         return False, None, None, "未找到 ffmpeg"
     except Exception as e:
         return False, None, None, str(e)
+    finally:
+        _sqr_cleanup_media_workdir(workdir)
 
 
 def _sqr_concat_video_clips(video_paths: list[str], output_path: str) -> tuple[bool, str]:
@@ -1924,16 +2179,37 @@ def _sqr_concat_video_clips(video_paths: list[str], output_path: str) -> tuple[b
         return False, "未找到 ffmpeg"
 
     list_path = None
+    workdir = None
+    cmd_output_path = output_path
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            for p in paths:
-                esc = str(p).replace("'", "'\''")
+        merge_sources = list(paths)
+        list_dir = None
+        needs_alias = _sqr_should_use_media_alias(output_path, *paths)
+        needs_ascii_list = os.name == "nt" and not _sqr_is_ascii_path(tempfile.gettempdir())
+        if needs_alias:
+            workdir = _sqr_make_media_workdir("sqr_concat_", [output_path] + paths)
+            merge_sources = [
+                _sqr_alias_media_input(p, workdir, f"in{i}")
+                for i, p in enumerate(paths)
+            ]
+            cmd_output_path = _sqr_alias_media_output(workdir, "out", output_path)
+            list_dir = workdir
+        elif needs_ascii_list:
+            workdir = _sqr_make_media_workdir("sqr_concat_list_", [output_path] + paths)
+            list_dir = workdir
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8", dir=list_dir) as f:
+            for p in merge_sources:
+                esc = _sqr_ffconcat_path(p)
                 f.write(f"file '{esc}'\n")
             list_path = f.name
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
-        resp = subprocess.run(cmd, capture_output=True, text=True)
-        if resp.returncode != 0 or not os.path.isfile(output_path):
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", cmd_output_path]
+        resp = _sqr_run_media_cmd(cmd)
+        if resp.returncode != 0 or not os.path.isfile(cmd_output_path):
             return False, (resp.stderr or resp.stdout or "ffmpeg concat failed")[-400:]
+        if cmd_output_path != output_path:
+            _sqr_replace_from_media_tmp(cmd_output_path, output_path)
+            cmd_output_path = output_path
         return True, "ok"
     except FileNotFoundError:
         return False, "未找到 ffmpeg"
@@ -1945,6 +2221,7 @@ def _sqr_concat_video_clips(video_paths: list[str], output_path: str) -> tuple[b
                 os.unlink(list_path)
             except Exception:
                 pass
+        _sqr_cleanup_media_workdir(workdir)
 
 
 def _sqr_finalize_segment_video(output_path: str, primary_path: str, primary_start_frame: int, primary_keep_frames: int,
@@ -2142,13 +2419,28 @@ def _sqr_replace_video_audio(video_path: str, audio_source_path: str, audio_star
     src = _sqr_resolve_media_path(audio_source_path) or str(audio_source_path or "")
     if not src or not os.path.isfile(src):
         return False, "音频源不存在"
-    if not _sqr_ffprobe_has_audio(src):
+    has_audio, probe_msg = _sqr_ffprobe_audio_state(src)
+    if has_audio is None:
+        detail = f"：{_sqr_short_error(probe_msg, 300)}" if probe_msg else ""
+        return False, f"ffprobe 无法读取音频源，疑似路径编码或文件权限问题{detail}"
+    if not has_audio:
         return False, "音频源中没有可用音轨"
     target_path = output_path or video_path
-    out_dir = os.path.dirname(os.path.realpath(target_path)) or os.getcwd()
-    fd, tmp_path = tempfile.mkstemp(prefix="sqr_audio_remux_", suffix=".mp4", dir=out_dir)
-    os.close(fd)
+    tmp_path = None
+    workdir = None
     try:
+        in_video_path = video_path
+        in_audio_path = src
+        if _sqr_should_use_media_alias(video_path, src, target_path):
+            workdir = _sqr_make_media_workdir("sqr_audio_", [target_path, video_path, src])
+            in_video_path = _sqr_alias_media_input(video_path, workdir, "video")
+            in_audio_path = _sqr_alias_media_input(src, workdir, "audio")
+            tmp_path = _sqr_alias_media_output(workdir, "out", target_path)
+        else:
+            out_dir = os.path.dirname(os.path.realpath(target_path)) or os.getcwd()
+            fd, tmp_path = tempfile.mkstemp(prefix="sqr_audio_remux_", suffix=".mp4", dir=out_dir)
+            os.close(fd)
+
         start_sec = max(0.0, float(audio_start_sec or 0.0))
         dur_sec = None
         if duration_sec is not None:
@@ -2167,8 +2459,8 @@ def _sqr_replace_video_audio(video_path: str, audio_source_path: str, audio_star
 
         cmd = [
             "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", src,
+            "-i", in_video_path,
+            "-i", in_audio_path,
             "-filter_complex", f"[1:a:0]{trim_expr}[aout]",
             "-map", "0:v:0",
             "-map", "[aout]",
@@ -2178,10 +2470,11 @@ def _sqr_replace_video_audio(video_path: str, audio_source_path: str, audio_star
             "-movflags", "+faststart",
             tmp_path,
         ]
-        resp = subprocess.run(cmd, capture_output=True, text=True)
+        resp = _sqr_run_media_cmd(cmd)
         if resp.returncode != 0:
             return False, (resp.stderr or "ffmpeg failed")[-400:]
-        os.replace(tmp_path, target_path)
+        _sqr_replace_from_media_tmp(tmp_path, target_path)
+        tmp_path = None
         return True, os.path.basename(target_path)
     except FileNotFoundError:
         return False, "未找到 ffmpeg/ffprobe"
@@ -2189,10 +2482,11 @@ def _sqr_replace_video_audio(video_path: str, audio_source_path: str, audio_star
         return False, str(e)
     finally:
         try:
-            if os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
         except Exception:
             pass
+        _sqr_cleanup_media_workdir(workdir)
 
 
 def merge_videos(video_paths: list, output_path: str, target_fps: float = None, log=None) -> bool:
@@ -2214,9 +2508,27 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None, 
 
     list_path = None
     converted: list[str] = []
+    workdir = None
+    cmd_output_path = output_path
     try:
         need_normalize, normalize_info = _sqr_video_merge_needs_normalize(video_paths, target_fps=target_fps)
-        merge_sources = list(video_paths)
+        source_paths = list(video_paths)
+        list_dir = None
+        needs_alias = _sqr_should_use_media_alias(output_path, *video_paths)
+        needs_ascii_list = os.name == "nt" and not _sqr_is_ascii_path(tempfile.gettempdir())
+        if needs_alias:
+            workdir = _sqr_make_media_workdir("sqr_merge_", [output_path] + list(video_paths))
+            source_paths = [
+                _sqr_alias_media_input(p, workdir, f"in{i}")
+                for i, p in enumerate(video_paths)
+            ]
+            cmd_output_path = _sqr_alias_media_output(workdir, "out", output_path)
+            list_dir = workdir
+        elif needs_ascii_list:
+            workdir = _sqr_make_media_workdir("sqr_merge_list_", [output_path] + list(video_paths))
+            list_dir = workdir
+
+        merge_sources = list(source_paths)
         if not need_normalize:
             _emit(f"视频合并：检测到 {len(video_paths)} 段视频规格一致，使用 -c copy 无损直接合并（零画质损失）")
         else:
@@ -2234,9 +2546,12 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None, 
             _emit(f"  不一致项: {_diff_desc}")
             _emit(f"  统一目标 fps: {fps_str}")
             merge_sources = []
-            for vp in video_paths:
-                fd, tmp = tempfile.mkstemp(prefix="sqr_merge_norm_", suffix=".mp4")
-                os.close(fd)
+            for idx, vp in enumerate(source_paths):
+                if workdir:
+                    tmp = os.path.join(workdir, f"norm{idx}.mp4")
+                else:
+                    fd, tmp = tempfile.mkstemp(prefix="sqr_merge_norm_", suffix=".mp4")
+                    os.close(fd)
                 cv_cmd = [
                     "ffmpeg", "-y", "-i", vp,
                     "-r", fps_str,
@@ -2247,23 +2562,26 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None, 
                     "-c:a", "aac", "-b:a", "192k",
                     tmp,
                 ]
-                r2 = subprocess.run(cv_cmd, capture_output=True, text=True)
+                r2 = _sqr_run_media_cmd(cv_cmd)
                 if r2.returncode != 0:
                     _emit(f"✗ 统一化转码失败: {os.path.basename(vp)} | {r2.stderr[-300:]}")
                     return False
                 converted.append(tmp)
                 merge_sources.append(tmp)
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8", dir=list_dir) as f:
             for p in merge_sources:
-                esc = str(p).replace("'", "'\''")
+                esc = _sqr_ffconcat_path(p)
                 f.write(f"file '{esc}'\n")
 
             list_path = f.name
 
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", cmd_output_path]
+        result = _sqr_run_media_cmd(cmd)
         if result.returncode == 0:
+            if cmd_output_path != output_path:
+                _sqr_replace_from_media_tmp(cmd_output_path, output_path)
+                cmd_output_path = output_path
             return True
         _emit(f"✗ ffmpeg concat 失败（{'统一化' if need_normalize else '-c copy'} 模式）: {result.stderr[-300:]}")
         return False
@@ -2282,6 +2600,7 @@ def merge_videos(video_paths: list, output_path: str, target_fps: float = None, 
                     os.unlink(_tmp)
             except Exception:
                 pass
+        _sqr_cleanup_media_workdir(workdir)
 
 
 class SegmentQueueRunner:
@@ -3613,7 +3932,7 @@ class SegmentQueueRunner:
 
 
 NODE_CLASS_MAPPINGS        = {"SegmentQueueRunner": SegmentQueueRunner}
-NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "🎬分段队列 v3.6@肥猴🐵@wuwu🚂@雪子❄️"}
+NODE_DISPLAY_NAME_MAPPINGS = {"SegmentQueueRunner": "🎬分段队列 v3.7@肥猴🐵@wuwu🚂@雪子❄️"}
 
 
 # ── 后端 API ─────────────────────────────────────────────────────
